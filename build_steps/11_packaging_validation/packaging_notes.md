@@ -1,0 +1,88 @@
+# Packaging Notes
+
+Last updated: 2026-07-02
+
+## Release Build Configuration
+
+- Source of truth: `src-tauri/tauri.conf.json`.
+- Product name: `Metafy Desktop`.
+- Identifier: `gg.metafy.desktop`.
+- Version: `0.1.0`.
+- Frontend build: `deno task build`.
+- macOS app bundle build: `deno task bundle:app`.
+- Tauri bundle target config: `bundle.active = true`, `bundle.targets = "all"`.
+- Local validation command: `deno task tauri build --bundles app`.
+- Local macOS app output: `src-tauri/target/release/bundle/macos/Metafy Desktop.app`.
+
+The `bundle:app` task intentionally validates the runnable application bundle
+without requiring installer generation. Installer formats should be validated in
+platform-specific release work.
+
+## macOS Notes
+
+- The release `.app` bundle builds successfully on this machine.
+- Current app bundle contents are the native executable, `Info.plist`, and
+  `icon.icns`.
+- `Info.plist` includes microphone and screen capture usage descriptions:
+  `NSMicrophoneUsageDescription` and `NSScreenCaptureUsageDescription`.
+- Runtime tools are system-installed, not bundled. The app checks explicit env
+  vars, `PATH`, and common Homebrew/MacPorts locations.
+- First manual launch should verify macOS screen recording and microphone
+  permissions from the packaged app, not only from `tauri dev`.
+
+## Windows Notes
+
+- Build on a Windows host with the same Tauri config and run
+  `deno task tauri build` or a Windows-specific Tauri bundle target.
+- FFmpeg, FFprobe, and whisper.cpp are not bundled. Install them on `PATH` or
+  set `METAFY_FFMPEG_PATH`, `METAFY_FFPROBE_PATH`, and
+  `METAFY_WHISPER_CPP_PATH`.
+- Validate Windows display capture permissions, microphone enumeration, MP4
+  playback, and local app data path behavior on the target host.
+- Installer packaging, signing, and auto-update are out of scope for the MVP
+  validation step.
+
+## Linux Notes
+
+- Build on the target Linux distribution with the same Tauri config and run
+  `deno task tauri build` or a Linux-specific Tauri bundle target.
+- FFmpeg, FFprobe, and whisper.cpp are not bundled. Install them on `PATH`, in a
+  common system location, or set the explicit env vars.
+- Validate capture support under the target display server. Wayland/X11 support
+  can vary by distribution, compositor, and portal setup.
+- Installer packaging, repository publication, and auto-update are out of scope
+  for the MVP validation step.
+
+## FFmpeg And Whisper Resource Audit
+
+- No FFmpeg, FFprobe, whisper.cpp binary, or Whisper model is bundled in the
+  current macOS `.app`.
+- FFmpeg lookup order: `METAFY_FFMPEG_PATH`, then `PATH`, then common system
+  install locations.
+- FFprobe lookup order: `METAFY_FFPROBE_PATH`, then `PATH`, then common system
+  install locations.
+- Whisper lookup order: `METAFY_WHISPER_CPP_PATH`, then `PATH`, then common
+  system install locations.
+- Whisper candidate binary names: `whisper-cli`, `main`, `whisper`.
+- Whisper models are local user resources under `app-data/models/whisper`.
+- Default model name remains `small.en`, with expected file
+  `ggml-small.en.bin`.
+
+## Offline And Privacy Notes
+
+- Core local defaults report `coreNetworkRequired = false` and
+  `rawMediaLeavesDevice = false`.
+- Source audit found HTTP client usage only in the optional AI summary path.
+- Optional AI remains disabled by default and validates transcript-only payloads
+  before making provider requests.
+- The core recording, encoding, transcription, search, and recovery workflows
+  have no backend, S3/R2, or cloud storage configuration.
+
+## Remaining Manual Validation
+
+- Launch the packaged app with network disabled and complete the core workflow.
+- Capture a 1080p 30 FPS recording on target hardware.
+- Verify playable MP4 output and microphone sync from that recording.
+- Run local Whisper with the default model against the captured recording.
+- Confirm local search returns timestamped transcript results.
+- Exercise failed encode/transcription recovery from the packaged app.
