@@ -25,6 +25,12 @@
     | "denied"
     | "unavailable"
     | "unknown";
+  type CaptureVideoSourceKind = "display" | "application" | "window";
+  type CaptureAudioMode =
+    | "none"
+    | "microphone"
+    | "source"
+    | "microphone_and_source";
 
   type AppBootstrap = {
     appName: string;
@@ -121,9 +127,13 @@
     videoPath: string;
     audioPath: string | null;
     metadataPath: string;
+    videoSourceId: string;
     screenSourceId: string;
     microphoneDeviceId: string | null;
     includeMicrophone: boolean;
+    audioMode: CaptureAudioMode;
+    microphoneAudioPath: string | null;
+    sourceAudioPath: string | null;
     width: number | null;
     height: number | null;
     frameRate: number;
@@ -132,6 +142,14 @@
     audioSampleRate: number | null;
     audioChannels: number | null;
     audioSampleFormat: string | null;
+    microphoneAudioByteCount: number;
+    microphoneAudioSampleRate: number | null;
+    microphoneAudioChannels: number | null;
+    microphoneAudioSampleFormat: string | null;
+    sourceAudioByteCount: number;
+    sourceAudioSampleRate: number | null;
+    sourceAudioChannels: number | null;
+    sourceAudioSampleFormat: string | null;
     startedAt: string;
     stoppedAt: string | null;
     durationMs: number | null;
@@ -252,11 +270,17 @@
     error: string | null;
   };
 
-  type CaptureDisplaySource = {
+  type CaptureVideoSource = {
     id: string;
+    kind: CaptureVideoSourceKind;
     title: string;
+    appName: string | null;
+    processId: number | null;
+    windowId: number | null;
     primary: boolean;
   };
+
+  type CaptureDisplaySource = CaptureVideoSource;
 
   type MicrophoneDevice = {
     id: string;
@@ -268,14 +292,31 @@
   };
 
   type CaptureSelection = {
+    videoSourceId: string | null;
     screenSourceId: string | null;
     microphoneDeviceId: string | null;
+    audioMode: CaptureAudioMode;
     includeMicrophone: boolean;
     updatedAt: string | null;
   };
 
+  type SourceAudioCaptureConfig = {
+    sourceId: string;
+    backend: string;
+    sampleRate: number | null;
+    channels: number | null;
+  };
+
+  type CaptureAudioConfig = {
+    mode: CaptureAudioMode;
+    microphone: MicrophoneDevice | null;
+    sourceAudio: SourceAudioCaptureConfig | null;
+  };
+
   type ValidatedCaptureConfig = {
+    videoSource: CaptureVideoSource;
     screenSource: CaptureDisplaySource;
+    audio: CaptureAudioConfig;
     microphone: MicrophoneDevice | null;
     includeMicrophone: boolean;
   };
@@ -283,11 +324,27 @@
   type CaptureStatus = {
     screen: CaptureCapability;
     microphone: CaptureCapability;
+    sourceAudio: CaptureCapability;
+    videoSources: CaptureVideoSource[];
     displays: CaptureDisplaySource[];
     microphones: MicrophoneDevice[];
     selection: CaptureSelection;
     validatedConfig: ValidatedCaptureConfig | null;
     validationErrors: string[];
+  };
+
+  type SourceGroup = {
+    kind: CaptureVideoSourceKind;
+    label: string;
+    sources: CaptureVideoSource[];
+  };
+
+  type AudioModeOption = {
+    mode: CaptureAudioMode;
+    label: string;
+    detail: string;
+    disabled: boolean;
+    disabledReason: string;
   };
 
   const dateFormatter = new Intl.DateTimeFormat(undefined, {
@@ -418,8 +475,9 @@
   let transcriptionError = $state("");
   let aiSettingsError = $state("");
   let aiSummaryError = $state("");
-  let selectedScreenSourceId = $state("");
+  let selectedVideoSourceId = $state("");
   let selectedMicrophoneDeviceId = $state("");
+  let selectedAudioMode = $state<CaptureAudioMode>("microphone");
   let selectedWhisperModel = $state("small.en");
   let aiEnabled = $state(false);
   let aiProvider = $state("openai_compatible");
@@ -442,9 +500,97 @@
     captureStatus !== null &&
       activeRecordingSession === null &&
       captureStatus.screen.permissionState === "granted" &&
-      captureStatus.displays.length > 0 &&
-      captureStatus.microphones.length > 0,
+      captureStatus.validatedConfig !== null,
   );
+
+  const allVideoSources = $derived.by(() => {
+    const sources = captureStatus?.videoSources ?? [];
+    return sources.length > 0 ? sources : (captureStatus?.displays ?? []);
+  });
+
+  const sourceGroups = $derived.by((): SourceGroup[] =>
+    [
+      {
+        kind: "display" as const,
+        label: "Displays",
+        sources: allVideoSources.filter((source) => source.kind === "display"),
+      },
+      {
+        kind: "application" as const,
+        label: "Applications",
+        sources: allVideoSources.filter((source) => source.kind === "application"),
+      },
+      {
+        kind: "window" as const,
+        label: "Windows",
+        sources: allVideoSources.filter((source) => source.kind === "window"),
+      },
+    ].filter((group) => group.sources.length > 0),
+  );
+
+  const selectedSource = $derived(
+    allVideoSources.find((source) => source.id === selectedVideoSourceId) ?? null,
+  );
+
+  const hasStaleSelectedSource = $derived(
+    captureStatus !== null &&
+      selectedVideoSourceId.length > 0 &&
+      selectedSource === null,
+  );
+
+  const microphoneUnavailableReason = $derived.by(() =>
+    captureStatus
+      ? captureCapabilityUnavailableReason(
+          captureStatus.microphone,
+          "Microphone audio",
+        )
+      : "",
+  );
+
+  const sourceAudioUnavailableReason = $derived.by(() =>
+    captureStatus
+      ? captureCapabilityUnavailableReason(
+          captureStatus.sourceAudio,
+          "Source audio",
+        )
+      : "Source audio status pending.",
+  );
+
+  const audioModeOptions = $derived.by((): AudioModeOption[] => {
+    const microphoneReason = microphoneUnavailableReason;
+    const sourceReason = sourceAudioUnavailableReason;
+
+    return [
+      {
+        mode: "none",
+        label: "No audio",
+        detail: "Video only",
+        disabled: false,
+        disabledReason: "",
+      },
+      {
+        mode: "microphone",
+        label: "Microphone",
+        detail: selectedMicrophoneLabel(),
+        disabled: microphoneReason.length > 0,
+        disabledReason: microphoneReason,
+      },
+      {
+        mode: "source",
+        label: "Source audio",
+        detail: selectedSource ? sourceOptionLabel(selectedSource) : "Selected source",
+        disabled: sourceReason.length > 0,
+        disabledReason: sourceReason,
+      },
+      {
+        mode: "microphone_and_source",
+        label: "Mic + source",
+        detail: "Microphone and selected source",
+        disabled: microphoneReason.length > 0 || sourceReason.length > 0,
+        disabledReason: [microphoneReason, sourceReason].filter(Boolean).join(" "),
+      },
+    ];
+  });
 
   const visibleJobs = $derived(
     selectedRecording ? selectedJobs : selectedJobs.slice(0, 3),
@@ -792,11 +938,15 @@
 
   function applyCaptureStatus(status: CaptureStatus) {
     captureStatus = status;
-    selectedScreenSourceId =
+    const sources = status.videoSources.length > 0 ? status.videoSources : status.displays;
+    selectedVideoSourceId =
+      status.selection.videoSourceId ??
       status.selection.screenSourceId ??
+      status.validatedConfig?.videoSource.id ??
       status.validatedConfig?.screenSource.id ??
-      status.displays.find((display) => display.primary)?.id ??
-      status.displays[0]?.id ??
+      sources.find((source) => source.kind === "display" && source.primary)?.id ??
+      sources.find((source) => source.kind === "display")?.id ??
+      sources[0]?.id ??
       "";
     selectedMicrophoneDeviceId =
       status.selection.microphoneDeviceId ??
@@ -804,6 +954,7 @@
       status.microphones.find((microphone) => microphone.isDefault)?.id ??
       status.microphones[0]?.id ??
       "";
+    selectedAudioMode = status.selection.audioMode;
   }
 
   function applyWhisperModelStatus(status: WhisperModelStatus) {
@@ -907,6 +1058,23 @@
     }
   }
 
+  async function refreshCaptureStatus() {
+    isCaptureLoading = true;
+    captureError = "";
+
+    try {
+      const status = await invoke<CaptureStatus>("capture_status");
+      applyCaptureStatus(status);
+    } catch (error) {
+      captureError =
+        error instanceof Error
+          ? error.message
+          : String(error || "Unable to refresh capture sources.");
+    } finally {
+      isCaptureLoading = false;
+    }
+  }
+
   async function saveCaptureSelection() {
     isCaptureLoading = true;
     captureError = "";
@@ -914,9 +1082,11 @@
     try {
       const status = await invoke<CaptureStatus>("save_capture_selection", {
         input: {
-          screenSourceId: selectedScreenSourceId || null,
+          videoSourceId: selectedVideoSourceId || null,
+          screenSourceId: selectedVideoSourceId || null,
           microphoneDeviceId: selectedMicrophoneDeviceId || null,
-          includeMicrophone: true,
+          audioMode: selectedAudioMode,
+          includeMicrophone: audioModeIncludesMicrophone(selectedAudioMode),
         },
       });
       applyCaptureStatus(status);
@@ -1195,13 +1365,17 @@
     return `${session.width} x ${session.height}`;
   }
 
-  function formatAudioSession(session: RecordingSession | null) {
-    if (!session?.audioPath) return "Microphone disabled";
-
+  function formatAudioStream(
+    path: string | null,
+    channels: number | null,
+    sampleRate: number | null,
+    sampleFormat: string | null,
+  ) {
+    if (!path) return "Off";
     const details = [];
-    if (session.audioChannels) details.push(`${session.audioChannels} ch`);
-    if (session.audioSampleRate) details.push(`${session.audioSampleRate} Hz`);
-    if (session.audioSampleFormat) details.push(session.audioSampleFormat);
+    if (channels) details.push(`${channels} ch`);
+    if (sampleRate) details.push(`${sampleRate} Hz`);
+    if (sampleFormat) details.push(sampleFormat);
 
     return details.join(" / ") || "PCM pending";
   }
@@ -1313,12 +1487,105 @@
     }
   }
 
-  function selectedDisplayLabel() {
-    const display = captureStatus?.displays.find(
-      (source) => source.id === selectedScreenSourceId,
-    );
+  function audioModeIncludesMicrophone(mode: CaptureAudioMode) {
+    return mode === "microphone" || mode === "microphone_and_source";
+  }
 
-    return display?.title ?? "No display selected";
+  function audioModeIncludesSourceAudio(mode: CaptureAudioMode) {
+    return mode === "source" || mode === "microphone_and_source";
+  }
+
+  function captureCapabilityUnavailableReason(
+    capability: CaptureCapability,
+    label: string,
+  ) {
+    if (!capability.supported) {
+      return capability.error ?? `${label} is not available on this platform.`;
+    }
+
+    if (
+      capability.permissionState === "denied" ||
+      capability.permissionState === "unavailable"
+    ) {
+      return capability.error ?? `${label} is unavailable.`;
+    }
+
+    return "";
+  }
+
+  function selectedSourceLabel() {
+    if (selectedSource) return sourceOptionLabel(selectedSource);
+    if (hasStaleSelectedSource) return staleSourceLabel();
+
+    return "No source selected";
+  }
+
+  function staleSourceLabel() {
+    return `${sourceKindLabelFromId(selectedVideoSourceId)} no longer available`;
+  }
+
+  function sourceKindLabelFromId(sourceId: string) {
+    const kind = sourceId.split(":")[0];
+
+    switch (kind) {
+      case "display":
+        return "Display";
+      case "application":
+        return "Application";
+      case "window":
+        return "Window";
+      default:
+        return "Source";
+    }
+  }
+
+  function sourceOptionLabel(source: CaptureVideoSource) {
+    const title = source.title.trim() || source.id;
+    const details = sourceOptionContext(source, title);
+
+    return details ? `${title} - ${details}` : title;
+  }
+
+  function sourceOptionContext(source: CaptureVideoSource, title: string) {
+    const details: string[] = [];
+
+    if (source.kind === "display" && source.primary) {
+      details.push("Primary");
+    }
+
+    if (source.kind === "application" && source.appName && source.appName !== title) {
+      details.push(source.appName);
+    }
+
+    if (source.kind === "application" && source.processId) {
+      details.push(`PID ${source.processId}`);
+    }
+
+    if (source.kind === "window") {
+      if (source.appName && source.appName !== title) details.push(source.appName);
+      if (source.windowId) details.push(`Window ${source.windowId}`);
+    }
+
+    return details.join(" / ");
+  }
+
+  function sourceAudioStatusLabel() {
+    if (!captureStatus) return "Not checked";
+    if (!captureStatus.sourceAudio.supported) return "Unavailable";
+    if (captureStatus.sourceAudio.permissionState === "granted") return "Ready";
+    return permissionLabel(captureStatus.sourceAudio.permissionState);
+  }
+
+  function activeMicrophoneAudioLabel(session: RecordingSession) {
+    return session.microphoneAudioPath
+      ? formatBytes(session.microphoneAudioByteCount)
+      : "Off";
+  }
+
+  function activeSourceAudioLabel(session: RecordingSession) {
+    return session.sourceAudioPath
+      ? formatBytes(session.sourceAudioByteCount)
+      : "Off";
   }
 
   function selectedMicrophoneLabel() {
@@ -1574,8 +1841,12 @@
                 <dd>{formatResolution(activeRecordingSession)}</dd>
               </div>
               <div>
-                <dt>Audio</dt>
-                <dd>{formatBytes(activeRecordingSession.audioByteCount)}</dd>
+                <dt>Mic audio</dt>
+                <dd>{activeMicrophoneAudioLabel(activeRecordingSession)}</dd>
+              </div>
+              <div>
+                <dt>Source audio</dt>
+                <dd>{activeSourceAudioLabel(activeRecordingSession)}</dd>
               </div>
             </dl>
           {/if}
@@ -1594,7 +1865,7 @@
                     )}
                   </span>
                 </div>
-                <p>{selectedDisplayLabel()}</p>
+                <p>{selectedSourceLabel()}</p>
                 {#if captureStatus?.screen.error}
                   <small>{captureStatus.screen.error}</small>
                 {/if}
@@ -1617,25 +1888,50 @@
                   <small>{captureStatus.microphone.error}</small>
                 {/if}
               </section>
+
+              <section aria-labelledby="source-audio-permission">
+                <div class="panel-heading-inline">
+                  <h3 id="source-audio-permission">Source audio</h3>
+                  <span
+                    class="status-chip"
+                    data-status={captureStatus?.sourceAudio.permissionState ?? "unknown"}
+                  >
+                    {sourceAudioStatusLabel()}
+                  </span>
+                </div>
+                <p>{selectedSource ? sourceOptionLabel(selectedSource) : "No source selected"}</p>
+                {#if captureStatus?.sourceAudio.error}
+                  <small>{captureStatus.sourceAudio.error}</small>
+                {/if}
+              </section>
             </div>
 
             <div class="capture-controls">
               <label>
-                <span>Display</span>
+                <span>Source</span>
                 <select
-                  bind:value={selectedScreenSourceId}
+                  bind:value={selectedVideoSourceId}
                   onchange={saveCaptureSelection}
                   disabled={
                     isCaptureLoading ||
                     activeRecordingSession !== null ||
-                    captureStatus?.displays.length === 0
+                    allVideoSources.length === 0
                   }
                 >
-                  <option value="">No display available</option>
-                  {#each captureStatus?.displays ?? [] as display (display.id)}
-                    <option value={display.id}>
-                      {display.title}{display.primary ? " (Primary)" : ""}
+                  <option value="">No source available</option>
+                  {#if hasStaleSelectedSource}
+                    <option value={selectedVideoSourceId} disabled>
+                      {staleSourceLabel()}
                     </option>
+                  {/if}
+                  {#each sourceGroups as group (group.kind)}
+                    <optgroup label={group.label}>
+                      {#each group.sources as source (source.id)}
+                        <option value={source.id}>
+                          {sourceOptionLabel(source)}
+                        </option>
+                      {/each}
+                    </optgroup>
                   {/each}
                 </select>
               </label>
@@ -1648,6 +1944,7 @@
                   disabled={
                     isCaptureLoading ||
                     activeRecordingSession !== null ||
+                    !audioModeIncludesMicrophone(selectedAudioMode) ||
                     captureStatus?.microphones.length === 0
                   }
                 >
@@ -1660,18 +1957,65 @@
                 </select>
               </label>
 
-              <button
-                class="ghost-button"
-                type="button"
-                onclick={requestCapturePermissions}
-                disabled={
-                  isCaptureLoading ||
-                  nativeStatus === "loading" ||
-                  activeRecordingSession !== null
-                }
+              <div class="capture-action-row">
+                <button
+                  class="ghost-button"
+                  type="button"
+                  onclick={refreshCaptureStatus}
+                  disabled={
+                    isCaptureLoading ||
+                    nativeStatus === "loading" ||
+                    activeRecordingSession !== null
+                  }
+                >
+                  Refresh sources
+                </button>
+                <button
+                  class="ghost-button"
+                  type="button"
+                  onclick={requestCapturePermissions}
+                  disabled={
+                    isCaptureLoading ||
+                    nativeStatus === "loading" ||
+                    activeRecordingSession !== null
+                  }
+                >
+                  {isCaptureLoading ? "Checking" : "Request access"}
+                </button>
+              </div>
+
+              <fieldset
+                class="audio-mode-control"
+                disabled={isCaptureLoading || activeRecordingSession !== null}
               >
-                {isCaptureLoading ? "Checking" : "Request access"}
-              </button>
+                <legend>Audio</legend>
+                <div class="audio-mode-options">
+                  {#each audioModeOptions as option (option.mode)}
+                    <label
+                      class:checked={selectedAudioMode === option.mode}
+                      class:disabled={option.disabled}
+                    >
+                      <input
+                        type="radio"
+                        bind:group={selectedAudioMode}
+                        value={option.mode}
+                        onchange={saveCaptureSelection}
+                        disabled={
+                          option.disabled ||
+                          isCaptureLoading ||
+                          activeRecordingSession !== null
+                        }
+                      />
+                      <span>
+                        <strong>{option.label}</strong>
+                        <small>
+                          {option.disabled ? option.disabledReason : option.detail}
+                        </small>
+                      </span>
+                    </label>
+                  {/each}
+                </div>
+              </fieldset>
             </div>
 
             {#if captureError}
@@ -1871,12 +2215,34 @@
                       <dd>{pathTail(selectedRecordingSession.videoPath)}</dd>
                     </div>
                     <div>
-                      <dt>Audio temp</dt>
-                      <dd>{pathTail(selectedRecordingSession.audioPath)}</dd>
+                      <dt>Mic temp</dt>
+                      <dd>{pathTail(selectedRecordingSession.microphoneAudioPath)}</dd>
                     </div>
                     <div>
-                      <dt>Audio format</dt>
-                      <dd>{formatAudioSession(selectedRecordingSession)}</dd>
+                      <dt>Mic audio</dt>
+                      <dd>
+                        {formatAudioStream(
+                          selectedRecordingSession.microphoneAudioPath,
+                          selectedRecordingSession.microphoneAudioChannels,
+                          selectedRecordingSession.microphoneAudioSampleRate,
+                          selectedRecordingSession.microphoneAudioSampleFormat,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Source temp</dt>
+                      <dd>{pathTail(selectedRecordingSession.sourceAudioPath)}</dd>
+                    </div>
+                    <div>
+                      <dt>Source audio</dt>
+                      <dd>
+                        {formatAudioStream(
+                          selectedRecordingSession.sourceAudioPath,
+                          selectedRecordingSession.sourceAudioChannels,
+                          selectedRecordingSession.sourceAudioSampleRate,
+                          selectedRecordingSession.sourceAudioSampleFormat,
+                        )}
+                      </dd>
                     </div>
                     <div>
                       <dt>Metadata</dt>
@@ -2701,7 +3067,7 @@
   }
 
   .capture-status-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .capture-status-grid section {
@@ -2726,8 +3092,95 @@
   }
 
   .capture-controls {
-    grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+    grid-template-columns: minmax(220px, 1fr) minmax(220px, 0.85fr) auto;
     align-items: end;
+  }
+
+  .capture-action-row {
+    display: flex;
+    align-items: end;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .audio-mode-control {
+    display: grid;
+    grid-column: 1 / -1;
+    gap: 8px;
+    min-width: 0;
+    margin: 0;
+    border: 0;
+    padding: 0;
+  }
+
+  .audio-mode-control legend {
+    color: #42483d;
+    font-size: 0.78rem;
+    font-weight: 700;
+    padding: 0;
+  }
+
+  .audio-mode-options {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .audio-mode-options label {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 9px;
+    align-items: start;
+    min-width: 0;
+    min-height: 62px;
+    border: 1px solid #ccd5c8;
+    border-radius: 8px;
+    background: #ffffff;
+    padding: 10px;
+  }
+
+  .audio-mode-options label.checked {
+    border-color: #257858;
+    background: #eef5ed;
+  }
+
+  .audio-mode-options label.disabled {
+    background: #f3f5f0;
+    color: #697065;
+  }
+
+  .audio-mode-options input[type="radio"] {
+    width: 16px;
+    height: 16px;
+    min-height: auto;
+    margin: 2px 0 0;
+    accent-color: #257858;
+  }
+
+  .audio-mode-options span {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .audio-mode-options strong {
+    color: #171914;
+    font-size: 0.84rem;
+    line-height: 1.2;
+  }
+
+  .audio-mode-options small {
+    color: #697065;
+    font-size: 0.72rem;
+    font-weight: 560;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+  }
+
+  .audio-mode-options label.disabled strong,
+  .audio-mode-options label.disabled small {
+    color: #697065;
   }
 
   .capture-errors {
@@ -2997,7 +3450,7 @@
   }
 
   .session-metrics {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     border-top: 1px solid #d9e1d5;
     padding-top: 16px;
   }
@@ -3307,6 +3760,10 @@
       grid-column: 1 / -1;
       margin-top: 0;
     }
+
+    .audio-mode-options {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
   }
 
   @media (max-width: 820px) {
@@ -3351,6 +3808,19 @@
     .session-metrics,
     .state-grid {
       grid-template-columns: 1fr;
+    }
+
+    .capture-action-row,
+    .audio-mode-options {
+      grid-template-columns: 1fr;
+    }
+
+    .capture-action-row {
+      justify-content: stretch;
+    }
+
+    .capture-action-row .ghost-button {
+      width: 100%;
     }
 
     .recording-console {

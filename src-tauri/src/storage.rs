@@ -15,7 +15,7 @@ const MODELS_DIRECTORY_NAME: &str = "models";
 const WHISPER_MODELS_DIRECTORY_NAME: &str = "whisper";
 const TEMP_DIRECTORY_NAME: &str = "temp";
 const RECORDING_SESSIONS_DIRECTORY_NAME: &str = "recording-sessions";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 10;
 const DEFAULT_AI_PROVIDER: &str = "openai_compatible";
 const DEFAULT_AI_MODEL_NAME: &str = "";
 const DEFAULT_AI_ENDPOINT_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -130,8 +130,10 @@ CREATE INDEX IF NOT EXISTS idx_processing_jobs_recording_id
 
 CREATE TABLE IF NOT EXISTS capture_preferences (
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    video_source_id TEXT,
     screen_source_id TEXT,
     microphone_device_id TEXT,
+    audio_mode TEXT NOT NULL DEFAULT 'microphone' CHECK (audio_mode IN ('none', 'microphone', 'source', 'microphone_and_source')),
     include_microphone INTEGER NOT NULL DEFAULT 1 CHECK (include_microphone IN (0, 1)),
     updated_at TEXT NOT NULL
 );
@@ -144,9 +146,18 @@ CREATE TABLE IF NOT EXISTS recording_sessions (
     video_path TEXT NOT NULL,
     audio_path TEXT,
     metadata_path TEXT NOT NULL,
+    video_source_id TEXT NOT NULL DEFAULT '',
     screen_source_id TEXT NOT NULL,
+    video_source_kind TEXT NOT NULL DEFAULT 'display' CHECK (video_source_kind IN ('display', 'application', 'window')),
+    video_source_title TEXT NOT NULL DEFAULT '',
+    video_source_app_name TEXT,
+    video_source_process_id INTEGER CHECK (video_source_process_id IS NULL OR video_source_process_id >= 0),
+    video_source_window_id INTEGER CHECK (video_source_window_id IS NULL OR video_source_window_id >= 0),
     microphone_device_id TEXT,
     include_microphone INTEGER NOT NULL CHECK (include_microphone IN (0, 1)),
+    audio_mode TEXT NOT NULL DEFAULT 'microphone' CHECK (audio_mode IN ('none', 'microphone', 'source', 'microphone_and_source')),
+    microphone_audio_path TEXT,
+    source_audio_path TEXT,
     width INTEGER CHECK (width IS NULL OR width > 0),
     height INTEGER CHECK (height IS NULL OR height > 0),
     frame_rate INTEGER NOT NULL CHECK (frame_rate > 0),
@@ -155,6 +166,14 @@ CREATE TABLE IF NOT EXISTS recording_sessions (
     audio_sample_rate INTEGER CHECK (audio_sample_rate IS NULL OR audio_sample_rate > 0),
     audio_channels INTEGER CHECK (audio_channels IS NULL OR audio_channels > 0),
     audio_sample_format TEXT,
+    microphone_audio_byte_count INTEGER NOT NULL DEFAULT 0 CHECK (microphone_audio_byte_count >= 0),
+    microphone_audio_sample_rate INTEGER CHECK (microphone_audio_sample_rate IS NULL OR microphone_audio_sample_rate > 0),
+    microphone_audio_channels INTEGER CHECK (microphone_audio_channels IS NULL OR microphone_audio_channels > 0),
+    microphone_audio_sample_format TEXT,
+    source_audio_byte_count INTEGER NOT NULL DEFAULT 0 CHECK (source_audio_byte_count >= 0),
+    source_audio_sample_rate INTEGER CHECK (source_audio_sample_rate IS NULL OR source_audio_sample_rate > 0),
+    source_audio_channels INTEGER CHECK (source_audio_channels IS NULL OR source_audio_channels > 0),
+    source_audio_sample_format TEXT,
     started_at TEXT NOT NULL,
     stopped_at TEXT,
     duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
@@ -289,6 +308,31 @@ local_status_enum!(RecordingSessionStatus {
     Failed => "failed",
 });
 
+local_status_enum!(CaptureAudioMode {
+    None => "none",
+    Microphone => "microphone",
+    Source => "source",
+    MicrophoneAndSource => "microphone_and_source",
+});
+
+impl CaptureAudioMode {
+    pub fn includes_microphone(&self) -> bool {
+        matches!(self, Self::Microphone | Self::MicrophoneAndSource)
+    }
+
+    pub fn includes_source_audio(&self) -> bool {
+        matches!(self, Self::Source | Self::MicrophoneAndSource)
+    }
+
+    fn from_include_microphone(include_microphone: bool) -> Self {
+        if include_microphone {
+            Self::Microphone
+        } else {
+            Self::None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageState {
     paths: StoragePaths,
@@ -351,9 +395,18 @@ pub struct RecordingSession {
     pub video_path: String,
     pub audio_path: Option<String>,
     pub metadata_path: String,
+    pub video_source_id: String,
     pub screen_source_id: String,
+    pub video_source_kind: String,
+    pub video_source_title: String,
+    pub video_source_app_name: Option<String>,
+    pub video_source_process_id: Option<i64>,
+    pub video_source_window_id: Option<i64>,
     pub microphone_device_id: Option<String>,
     pub include_microphone: bool,
+    pub audio_mode: CaptureAudioMode,
+    pub microphone_audio_path: Option<String>,
+    pub source_audio_path: Option<String>,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub frame_rate: i64,
@@ -362,6 +415,14 @@ pub struct RecordingSession {
     pub audio_sample_rate: Option<i64>,
     pub audio_channels: Option<i64>,
     pub audio_sample_format: Option<String>,
+    pub microphone_audio_byte_count: i64,
+    pub microphone_audio_sample_rate: Option<i64>,
+    pub microphone_audio_channels: Option<i64>,
+    pub microphone_audio_sample_format: Option<String>,
+    pub source_audio_byte_count: i64,
+    pub source_audio_sample_rate: Option<i64>,
+    pub source_audio_channels: Option<i64>,
+    pub source_audio_sample_format: Option<String>,
     pub started_at: String,
     pub stopped_at: Option<String>,
     pub duration_ms: Option<i64>,
@@ -588,8 +649,10 @@ pub struct ProcessingJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSelection {
+    pub video_source_id: Option<String>,
     pub screen_source_id: Option<String>,
     pub microphone_device_id: Option<String>,
+    pub audio_mode: CaptureAudioMode,
     pub include_microphone: bool,
     pub updated_at: Option<String>,
 }
@@ -597,8 +660,10 @@ pub struct CaptureSelection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveCaptureSelectionInput {
+    pub video_source_id: Option<String>,
     pub screen_source_id: Option<String>,
     pub microphone_device_id: Option<String>,
+    pub audio_mode: Option<CaptureAudioMode>,
     pub include_microphone: Option<bool>,
 }
 
@@ -611,15 +676,30 @@ pub struct CreateRecordingSessionInput {
     pub video_path: String,
     pub audio_path: Option<String>,
     pub metadata_path: String,
+    pub video_source_id: String,
     pub screen_source_id: String,
+    pub video_source_kind: String,
+    pub video_source_title: String,
+    pub video_source_app_name: Option<String>,
+    pub video_source_process_id: Option<i64>,
+    pub video_source_window_id: Option<i64>,
     pub microphone_device_id: Option<String>,
     pub include_microphone: bool,
+    pub audio_mode: CaptureAudioMode,
+    pub microphone_audio_path: Option<String>,
+    pub source_audio_path: Option<String>,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub frame_rate: i64,
     pub audio_sample_rate: Option<i64>,
     pub audio_channels: Option<i64>,
     pub audio_sample_format: Option<String>,
+    pub microphone_audio_sample_rate: Option<i64>,
+    pub microphone_audio_channels: Option<i64>,
+    pub microphone_audio_sample_format: Option<String>,
+    pub source_audio_sample_rate: Option<i64>,
+    pub source_audio_channels: Option<i64>,
+    pub source_audio_sample_format: Option<String>,
     pub started_at: String,
 }
 
@@ -635,6 +715,14 @@ pub struct FinishRecordingSessionInput {
     pub audio_sample_rate: Option<i64>,
     pub audio_channels: Option<i64>,
     pub audio_sample_format: Option<String>,
+    pub microphone_audio_byte_count: i64,
+    pub microphone_audio_sample_rate: Option<i64>,
+    pub microphone_audio_channels: Option<i64>,
+    pub microphone_audio_sample_format: Option<String>,
+    pub source_audio_byte_count: i64,
+    pub source_audio_sample_rate: Option<i64>,
+    pub source_audio_channels: Option<i64>,
+    pub source_audio_sample_format: Option<String>,
     pub stopped_at: String,
     pub duration_ms: i64,
     pub failure_message: Option<String>,
@@ -643,11 +731,14 @@ pub struct FinishRecordingSessionInput {
 #[derive(Debug, Clone)]
 pub struct RecordingSessionFiles {
     pub video_path: PathBuf,
-    pub audio_path: Option<PathBuf>,
+    pub microphone_audio_path: Option<PathBuf>,
+    pub source_audio_path: Option<PathBuf>,
     pub metadata_path: PathBuf,
     pub temp_directory_relative: String,
     pub video_path_relative: String,
     pub audio_path_relative: Option<String>,
+    pub microphone_audio_path_relative: Option<String>,
+    pub source_audio_path_relative: Option<String>,
     pub metadata_path_relative: String,
 }
 
@@ -992,7 +1083,7 @@ impl StorageState {
     pub fn prepare_recording_session_files(
         &self,
         session_id: &str,
-        include_microphone: bool,
+        audio_mode: &CaptureAudioMode,
     ) -> Result<RecordingSessionFiles, StorageError> {
         let temp_directory = self
             .paths
@@ -1004,19 +1095,29 @@ impl StorageState {
         let temp_directory_relative =
             format!("{TEMP_DIRECTORY_NAME}/{RECORDING_SESSIONS_DIRECTORY_NAME}/{session_id}");
         let video_path_relative = format!("{temp_directory_relative}/screen_frames.mfrv");
-        let audio_path_relative =
-            include_microphone.then(|| format!("{temp_directory_relative}/microphone.pcm"));
+        let microphone_audio_path_relative = audio_mode
+            .includes_microphone()
+            .then(|| format!("{temp_directory_relative}/microphone.pcm"));
+        let source_audio_path_relative = audio_mode
+            .includes_source_audio()
+            .then(|| format!("{temp_directory_relative}/source_audio.pcm"));
+        let audio_path_relative = microphone_audio_path_relative.clone();
         let metadata_path_relative = format!("{temp_directory_relative}/session.json");
 
         Ok(RecordingSessionFiles {
             video_path: self.paths.root.join(&video_path_relative),
-            audio_path: audio_path_relative
+            microphone_audio_path: microphone_audio_path_relative
+                .as_ref()
+                .map(|path| self.paths.root.join(path)),
+            source_audio_path: source_audio_path_relative
                 .as_ref()
                 .map(|path| self.paths.root.join(path)),
             metadata_path: self.paths.root.join(&metadata_path_relative),
             temp_directory_relative,
             video_path_relative,
             audio_path_relative,
+            microphone_audio_path_relative,
+            source_audio_path_relative,
             metadata_path_relative,
         })
     }
@@ -1107,14 +1208,23 @@ impl StorageState {
             r#"
             INSERT INTO recording_sessions (
                 id, recording_id, status, temp_directory, video_path, audio_path,
-                metadata_path, screen_source_id, microphone_device_id, include_microphone,
+                metadata_path, video_source_id, screen_source_id, video_source_kind, video_source_title,
+                video_source_app_name, video_source_process_id, video_source_window_id,
+                microphone_device_id, include_microphone, audio_mode,
+                microphone_audio_path, source_audio_path,
                 width, height, frame_rate, audio_sample_rate, audio_channels,
-                audio_sample_format, started_at, created_at, updated_at
+                audio_sample_format, microphone_audio_sample_rate, microphone_audio_channels,
+                microphone_audio_sample_format, source_audio_sample_rate, source_audio_channels,
+                source_audio_sample_format, started_at, created_at, updated_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
-                ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19
+                ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14,
+                ?15, ?16, ?17,
+                ?18, ?19,
+                ?20, ?21, ?22, ?23, ?24,
+                ?25, ?26, ?27, ?28, ?29,
+                ?30, ?31, ?32, ?33, ?34
             )
             "#,
             params![
@@ -1125,15 +1235,30 @@ impl StorageState {
                 input.video_path,
                 input.audio_path,
                 input.metadata_path,
+                input.video_source_id,
                 input.screen_source_id,
+                input.video_source_kind,
+                input.video_source_title,
+                input.video_source_app_name,
+                input.video_source_process_id,
+                input.video_source_window_id,
                 input.microphone_device_id,
                 if input.include_microphone { 1 } else { 0 },
+                input.audio_mode.as_str(),
+                input.microphone_audio_path,
+                input.source_audio_path,
                 input.width,
                 input.height,
                 input.frame_rate,
                 input.audio_sample_rate,
                 input.audio_channels,
                 input.audio_sample_format,
+                input.microphone_audio_sample_rate,
+                input.microphone_audio_channels,
+                input.microphone_audio_sample_format,
+                input.source_audio_sample_rate,
+                input.source_audio_channels,
+                input.source_audio_sample_format,
                 input.started_at,
                 now,
                 now,
@@ -1155,6 +1280,12 @@ impl StorageState {
         audio_sample_rate: Option<i64>,
         audio_channels: Option<i64>,
         audio_sample_format: Option<String>,
+        microphone_audio_sample_rate: Option<i64>,
+        microphone_audio_channels: Option<i64>,
+        microphone_audio_sample_format: Option<String>,
+        source_audio_sample_rate: Option<i64>,
+        source_audio_channels: Option<i64>,
+        source_audio_sample_format: Option<String>,
     ) -> Result<RecordingSession, StorageError> {
         let existing = self
             .get_recording_session(id)?
@@ -1174,7 +1305,13 @@ impl StorageState {
                 audio_sample_rate = ?4,
                 audio_channels = ?5,
                 audio_sample_format = ?6,
-                updated_at = ?7
+                microphone_audio_sample_rate = ?7,
+                microphone_audio_channels = ?8,
+                microphone_audio_sample_format = ?9,
+                source_audio_sample_rate = ?10,
+                source_audio_channels = ?11,
+                source_audio_sample_format = ?12,
+                updated_at = ?13
             WHERE id = ?1
             "#,
             params![
@@ -1184,6 +1321,12 @@ impl StorageState {
                 audio_sample_rate.or(existing.audio_sample_rate),
                 audio_channels.or(existing.audio_channels),
                 audio_sample_format.or(existing.audio_sample_format),
+                microphone_audio_sample_rate.or(existing.microphone_audio_sample_rate),
+                microphone_audio_channels.or(existing.microphone_audio_channels),
+                microphone_audio_sample_format.or(existing.microphone_audio_sample_format),
+                source_audio_sample_rate.or(existing.source_audio_sample_rate),
+                source_audio_channels.or(existing.source_audio_channels),
+                source_audio_sample_format.or(existing.source_audio_sample_format),
                 now,
             ],
         )?;
@@ -1220,10 +1363,18 @@ impl StorageState {
                 audio_sample_rate = ?7,
                 audio_channels = ?8,
                 audio_sample_format = ?9,
-                stopped_at = ?10,
-                duration_ms = ?11,
-                failure_message = ?12,
-                updated_at = ?13
+                microphone_audio_byte_count = ?10,
+                microphone_audio_sample_rate = ?11,
+                microphone_audio_channels = ?12,
+                microphone_audio_sample_format = ?13,
+                source_audio_byte_count = ?14,
+                source_audio_sample_rate = ?15,
+                source_audio_channels = ?16,
+                source_audio_sample_format = ?17,
+                stopped_at = ?18,
+                duration_ms = ?19,
+                failure_message = ?20,
+                updated_at = ?21
             WHERE id = ?1
             "#,
             params![
@@ -1236,6 +1387,26 @@ impl StorageState {
                 input.audio_sample_rate.or(existing.audio_sample_rate),
                 input.audio_channels.or(existing.audio_channels),
                 input.audio_sample_format.or(existing.audio_sample_format),
+                input.microphone_audio_byte_count,
+                input
+                    .microphone_audio_sample_rate
+                    .or(existing.microphone_audio_sample_rate),
+                input
+                    .microphone_audio_channels
+                    .or(existing.microphone_audio_channels),
+                input
+                    .microphone_audio_sample_format
+                    .or(existing.microphone_audio_sample_format),
+                input.source_audio_byte_count,
+                input
+                    .source_audio_sample_rate
+                    .or(existing.source_audio_sample_rate),
+                input
+                    .source_audio_channels
+                    .or(existing.source_audio_channels),
+                input
+                    .source_audio_sample_format
+                    .or(existing.source_audio_sample_format),
                 input.stopped_at,
                 input.duration_ms,
                 input.failure_message,
@@ -1260,9 +1431,16 @@ impl StorageState {
                 r#"
                 SELECT
                     id, recording_id, status, temp_directory, video_path, audio_path,
-                    metadata_path, screen_source_id, microphone_device_id, include_microphone,
+                    metadata_path, video_source_id, screen_source_id, video_source_kind, video_source_title,
+                    video_source_app_name, video_source_process_id, video_source_window_id,
+                    microphone_device_id, include_microphone, audio_mode,
+                    microphone_audio_path, source_audio_path,
                     width, height, frame_rate, frame_count, audio_byte_count,
-                    audio_sample_rate, audio_channels, audio_sample_format, started_at,
+                    audio_sample_rate, audio_channels, audio_sample_format,
+                    microphone_audio_byte_count, microphone_audio_sample_rate,
+                    microphone_audio_channels, microphone_audio_sample_format,
+                    source_audio_byte_count, source_audio_sample_rate,
+                    source_audio_channels, source_audio_sample_format, started_at,
                     stopped_at, duration_ms, failure_message, created_at, updated_at
                 FROM recording_sessions
                 WHERE id = ?1
@@ -1284,9 +1462,16 @@ impl StorageState {
                 r#"
                 SELECT
                     id, recording_id, status, temp_directory, video_path, audio_path,
-                    metadata_path, screen_source_id, microphone_device_id, include_microphone,
+                    metadata_path, video_source_id, screen_source_id, video_source_kind, video_source_title,
+                    video_source_app_name, video_source_process_id, video_source_window_id,
+                    microphone_device_id, include_microphone, audio_mode,
+                    microphone_audio_path, source_audio_path,
                     width, height, frame_rate, frame_count, audio_byte_count,
-                    audio_sample_rate, audio_channels, audio_sample_format, started_at,
+                    audio_sample_rate, audio_channels, audio_sample_format,
+                    microphone_audio_byte_count, microphone_audio_sample_rate,
+                    microphone_audio_channels, microphone_audio_sample_format,
+                    source_audio_byte_count, source_audio_sample_rate,
+                    source_audio_channels, source_audio_sample_format, started_at,
                     stopped_at, duration_ms, failure_message, created_at, updated_at
                 FROM recording_sessions
                 WHERE recording_id = ?1
@@ -2042,7 +2227,19 @@ impl StorageState {
         let selection = connection
             .query_row(
                 r#"
-                SELECT screen_source_id, microphone_device_id, include_microphone, updated_at
+                SELECT
+                    COALESCE(NULLIF(video_source_id, ''), NULLIF(screen_source_id, '')),
+                    screen_source_id,
+                    microphone_device_id,
+                    COALESCE(
+                        NULLIF(audio_mode, ''),
+                        CASE include_microphone
+                            WHEN 1 THEN 'microphone'
+                            ELSE 'none'
+                        END
+                    ),
+                    include_microphone,
+                    updated_at
                 FROM capture_preferences
                 WHERE id = 1
                 "#,
@@ -2060,23 +2257,32 @@ impl StorageState {
         input: SaveCaptureSelectionInput,
     ) -> Result<CaptureSelection, StorageError> {
         let connection = self.open_connection()?;
-        let include_microphone = input.include_microphone.unwrap_or(true);
+        let video_source_id = normalized_setting(input.video_source_id.or(input.screen_source_id));
+        let audio_mode = input.audio_mode.unwrap_or_else(|| {
+            CaptureAudioMode::from_include_microphone(input.include_microphone.unwrap_or(true))
+        });
+        let include_microphone = audio_mode.includes_microphone();
         let updated_at = now_timestamp();
 
         connection.execute(
             r#"
             INSERT INTO capture_preferences (
-                id, screen_source_id, microphone_device_id, include_microphone, updated_at
-            ) VALUES (1, ?1, ?2, ?3, ?4)
+                id, video_source_id, screen_source_id, microphone_device_id, audio_mode,
+                include_microphone, updated_at
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(id) DO UPDATE SET
+                video_source_id = excluded.video_source_id,
                 screen_source_id = excluded.screen_source_id,
                 microphone_device_id = excluded.microphone_device_id,
+                audio_mode = excluded.audio_mode,
                 include_microphone = excluded.include_microphone,
                 updated_at = excluded.updated_at
             "#,
             params![
-                input.screen_source_id,
+                video_source_id.clone(),
+                video_source_id,
                 input.microphone_device_id,
+                audio_mode.as_str(),
                 if include_microphone { 1 } else { 0 },
                 updated_at,
             ],
@@ -2138,6 +2344,244 @@ fn run_migrations(connection: &Connection) -> Result<(), StorageError> {
         "processing_jobs",
         "last_error_at",
         "ALTER TABLE processing_jobs ADD COLUMN last_error_at TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "capture_preferences",
+        "video_source_id",
+        "ALTER TABLE capture_preferences ADD COLUMN video_source_id TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "capture_preferences",
+        "audio_mode",
+        "ALTER TABLE capture_preferences ADD COLUMN audio_mode TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "video_source_id",
+        "ALTER TABLE recording_sessions ADD COLUMN video_source_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "video_source_kind",
+        "ALTER TABLE recording_sessions ADD COLUMN video_source_kind TEXT NOT NULL DEFAULT 'display' CHECK (video_source_kind IN ('display', 'application', 'window'))",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "video_source_title",
+        "ALTER TABLE recording_sessions ADD COLUMN video_source_title TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "video_source_app_name",
+        "ALTER TABLE recording_sessions ADD COLUMN video_source_app_name TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "video_source_process_id",
+        "ALTER TABLE recording_sessions ADD COLUMN video_source_process_id INTEGER CHECK (video_source_process_id IS NULL OR video_source_process_id >= 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "video_source_window_id",
+        "ALTER TABLE recording_sessions ADD COLUMN video_source_window_id INTEGER CHECK (video_source_window_id IS NULL OR video_source_window_id >= 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "audio_mode",
+        "ALTER TABLE recording_sessions ADD COLUMN audio_mode TEXT NOT NULL DEFAULT 'microphone' CHECK (audio_mode IN ('none', 'microphone', 'source', 'microphone_and_source'))",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "microphone_audio_path",
+        "ALTER TABLE recording_sessions ADD COLUMN microphone_audio_path TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "source_audio_path",
+        "ALTER TABLE recording_sessions ADD COLUMN source_audio_path TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "microphone_audio_byte_count",
+        "ALTER TABLE recording_sessions ADD COLUMN microphone_audio_byte_count INTEGER NOT NULL DEFAULT 0 CHECK (microphone_audio_byte_count >= 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "microphone_audio_sample_rate",
+        "ALTER TABLE recording_sessions ADD COLUMN microphone_audio_sample_rate INTEGER CHECK (microphone_audio_sample_rate IS NULL OR microphone_audio_sample_rate > 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "microphone_audio_channels",
+        "ALTER TABLE recording_sessions ADD COLUMN microphone_audio_channels INTEGER CHECK (microphone_audio_channels IS NULL OR microphone_audio_channels > 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "microphone_audio_sample_format",
+        "ALTER TABLE recording_sessions ADD COLUMN microphone_audio_sample_format TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "source_audio_byte_count",
+        "ALTER TABLE recording_sessions ADD COLUMN source_audio_byte_count INTEGER NOT NULL DEFAULT 0 CHECK (source_audio_byte_count >= 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "source_audio_sample_rate",
+        "ALTER TABLE recording_sessions ADD COLUMN source_audio_sample_rate INTEGER CHECK (source_audio_sample_rate IS NULL OR source_audio_sample_rate > 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "source_audio_channels",
+        "ALTER TABLE recording_sessions ADD COLUMN source_audio_channels INTEGER CHECK (source_audio_channels IS NULL OR source_audio_channels > 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "recording_sessions",
+        "source_audio_sample_format",
+        "ALTER TABLE recording_sessions ADD COLUMN source_audio_sample_format TEXT",
+    )?;
+    connection.execute(
+        r#"
+        UPDATE capture_preferences
+        SET
+            video_source_id = COALESCE(NULLIF(video_source_id, ''), NULLIF(screen_source_id, '')),
+            audio_mode = CASE
+                WHEN audio_mode IS NULL OR audio_mode = '' THEN
+                    CASE include_microphone
+                        WHEN 1 THEN ?1
+                        ELSE ?2
+                    END
+                ELSE audio_mode
+            END
+        "#,
+        params![
+            CaptureAudioMode::Microphone.as_str(),
+            CaptureAudioMode::None.as_str()
+        ],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE recording_sessions
+        SET
+            video_source_id = COALESCE(NULLIF(video_source_id, ''), NULLIF(screen_source_id, ''), screen_source_id),
+            video_source_kind = CASE
+                WHEN screen_source_id LIKE 'window:%' THEN 'window'
+                WHEN screen_source_id LIKE 'application:%' THEN 'application'
+                ELSE 'display'
+            END,
+            video_source_title = CASE
+                WHEN video_source_title IS NULL OR video_source_title = '' THEN screen_source_id
+                ELSE video_source_title
+            END,
+            video_source_window_id = CASE
+                WHEN screen_source_id GLOB 'window:[0-9]*' THEN CAST(substr(screen_source_id, 8) AS INTEGER)
+                ELSE video_source_window_id
+            END
+        "#,
+        [],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE recording_sessions
+        SET audio_mode = CASE
+            WHEN audio_mode IS NULL
+                OR audio_mode = ''
+                OR (audio_mode = 'microphone' AND include_microphone = 0)
+            THEN
+                CASE
+                    WHEN include_microphone = 1 AND audio_path LIKE '%source_audio.pcm' THEN 'microphone_and_source'
+                    WHEN include_microphone = 1 THEN 'microphone'
+                    WHEN audio_path LIKE '%source_audio.pcm' THEN 'source'
+                    WHEN audio_path IS NOT NULL AND audio_path != '' THEN 'microphone'
+                    ELSE 'none'
+                END
+            ELSE audio_mode
+        END
+        "#,
+        [],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE recording_sessions
+        SET
+            microphone_audio_path = COALESCE(
+                microphone_audio_path,
+                CASE
+                    WHEN audio_path IS NOT NULL
+                        AND audio_path != ''
+                        AND audio_mode != 'source'
+                    THEN audio_path
+                    ELSE NULL
+                END
+            ),
+            source_audio_path = COALESCE(
+                source_audio_path,
+                CASE
+                    WHEN audio_path IS NOT NULL
+                        AND audio_path != ''
+                        AND audio_mode = 'source'
+                    THEN audio_path
+                    ELSE NULL
+                END
+            )
+        "#,
+        [],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE recording_sessions
+        SET
+            microphone_audio_byte_count = CASE
+                WHEN microphone_audio_path IS NOT NULL
+                    AND microphone_audio_byte_count = 0
+                THEN audio_byte_count
+                ELSE microphone_audio_byte_count
+            END,
+            microphone_audio_sample_rate = COALESCE(microphone_audio_sample_rate, audio_sample_rate),
+            microphone_audio_channels = COALESCE(microphone_audio_channels, audio_channels),
+            microphone_audio_sample_format = COALESCE(microphone_audio_sample_format, audio_sample_format),
+            source_audio_byte_count = CASE
+                WHEN source_audio_path IS NOT NULL
+                    AND source_audio_byte_count = 0
+                THEN audio_byte_count
+                ELSE source_audio_byte_count
+            END,
+            source_audio_sample_rate = CASE
+                WHEN source_audio_path IS NOT NULL
+                THEN COALESCE(source_audio_sample_rate, audio_sample_rate)
+                ELSE source_audio_sample_rate
+            END,
+            source_audio_channels = CASE
+                WHEN source_audio_path IS NOT NULL
+                THEN COALESCE(source_audio_channels, audio_channels)
+                ELSE source_audio_channels
+            END,
+            source_audio_sample_format = CASE
+                WHEN source_audio_path IS NOT NULL
+                THEN COALESCE(source_audio_sample_format, audio_sample_format)
+                ELSE source_audio_sample_format
+            END
+        "#,
+        [],
     )?;
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -2295,7 +2739,74 @@ fn map_recording_row(row: &Row<'_>) -> rusqlite::Result<Recording> {
 }
 
 fn map_recording_session_row(row: &Row<'_>) -> rusqlite::Result<RecordingSession> {
-    let include_microphone: i64 = row.get(9)?;
+    let legacy_audio_path = row.get::<_, Option<String>>(5)?;
+    let video_source_id = row.get::<_, String>(7)?;
+    let screen_source_id = row.get::<_, String>(8)?;
+    let include_microphone: i64 = row.get(15)?;
+    let audio_mode = enum_from_column(row, 16, "CaptureAudioMode", CaptureAudioMode::from_db)?;
+    let microphone_audio_path = row.get::<_, Option<String>>(17)?.or_else(|| {
+        legacy_audio_path
+            .as_ref()
+            .filter(|_| audio_mode != CaptureAudioMode::Source)
+            .cloned()
+    });
+    let source_audio_path = row.get::<_, Option<String>>(18)?.or_else(|| {
+        legacy_audio_path
+            .as_ref()
+            .filter(|path| audio_mode == CaptureAudioMode::Source && !path.is_empty())
+            .cloned()
+    });
+    let legacy_audio_byte_count = row.get(23)?;
+    let legacy_audio_sample_rate = row.get(24)?;
+    let legacy_audio_channels = row.get(25)?;
+    let legacy_audio_sample_format = row.get::<_, Option<String>>(26)?;
+    let microphone_audio_byte_count = fallback_stream_byte_count(
+        row.get(27)?,
+        microphone_audio_path.as_deref(),
+        legacy_audio_byte_count,
+    );
+    let source_audio_byte_count = fallback_stream_byte_count(
+        row.get(31)?,
+        source_audio_path.as_deref(),
+        legacy_audio_byte_count,
+    );
+    let microphone_audio_sample_rate =
+        row.get::<_, Option<i64>>(28)?
+            .or_else(|| match microphone_audio_path.as_deref() {
+                Some(_) => legacy_audio_sample_rate,
+                None => None,
+            });
+    let microphone_audio_channels =
+        row.get::<_, Option<i64>>(29)?
+            .or_else(|| match microphone_audio_path.as_deref() {
+                Some(_) => legacy_audio_channels,
+                None => None,
+            });
+    let microphone_audio_sample_format =
+        row.get::<_, Option<String>>(30)?
+            .or_else(|| match microphone_audio_path.as_deref() {
+                Some(_) => legacy_audio_sample_format.clone(),
+                None => None,
+            });
+    let source_audio_sample_rate =
+        row.get::<_, Option<i64>>(32)?
+            .or_else(|| match source_audio_path.as_deref() {
+                Some(_) => legacy_audio_sample_rate,
+                None => None,
+            });
+    let source_audio_channels = row
+        .get::<_, Option<i64>>(33)?
+        .or_else(|| match source_audio_path.as_deref() {
+            Some(_) => legacy_audio_channels,
+            None => None,
+        });
+    let source_audio_sample_format =
+        row.get::<_, Option<String>>(34)?
+            .or_else(|| match source_audio_path.as_deref() {
+                Some(_) => legacy_audio_sample_format.clone(),
+                None => None,
+            });
+    let audio_path = legacy_audio_path.or_else(|| microphone_audio_path.clone());
 
     Ok(RecordingSession {
         id: row.get(0)?,
@@ -2308,26 +2819,59 @@ fn map_recording_session_row(row: &Row<'_>) -> rusqlite::Result<RecordingSession
         )?,
         temp_directory: row.get(3)?,
         video_path: row.get(4)?,
-        audio_path: row.get(5)?,
+        audio_path,
         metadata_path: row.get(6)?,
-        screen_source_id: row.get(7)?,
-        microphone_device_id: row.get(8)?,
+        video_source_id: if video_source_id.is_empty() {
+            screen_source_id.clone()
+        } else {
+            video_source_id
+        },
+        screen_source_id,
+        video_source_kind: row.get(9)?,
+        video_source_title: row.get(10)?,
+        video_source_app_name: row.get(11)?,
+        video_source_process_id: row.get(12)?,
+        video_source_window_id: row.get(13)?,
+        microphone_device_id: row.get(14)?,
         include_microphone: include_microphone == 1,
-        width: row.get(10)?,
-        height: row.get(11)?,
-        frame_rate: row.get(12)?,
-        frame_count: row.get(13)?,
-        audio_byte_count: row.get(14)?,
-        audio_sample_rate: row.get(15)?,
-        audio_channels: row.get(16)?,
-        audio_sample_format: row.get(17)?,
-        started_at: row.get(18)?,
-        stopped_at: row.get(19)?,
-        duration_ms: row.get(20)?,
-        failure_message: row.get(21)?,
-        created_at: row.get(22)?,
-        updated_at: row.get(23)?,
+        audio_mode,
+        microphone_audio_path,
+        source_audio_path,
+        width: row.get(19)?,
+        height: row.get(20)?,
+        frame_rate: row.get(21)?,
+        frame_count: row.get(22)?,
+        audio_byte_count: legacy_audio_byte_count,
+        audio_sample_rate: legacy_audio_sample_rate,
+        audio_channels: legacy_audio_channels,
+        audio_sample_format: legacy_audio_sample_format,
+        microphone_audio_byte_count,
+        microphone_audio_sample_rate,
+        microphone_audio_channels,
+        microphone_audio_sample_format,
+        source_audio_byte_count,
+        source_audio_sample_rate,
+        source_audio_channels,
+        source_audio_sample_format,
+        started_at: row.get(35)?,
+        stopped_at: row.get(36)?,
+        duration_ms: row.get(37)?,
+        failure_message: row.get(38)?,
+        created_at: row.get(39)?,
+        updated_at: row.get(40)?,
     })
+}
+
+fn fallback_stream_byte_count(
+    stream_byte_count: i64,
+    stream_path: Option<&str>,
+    legacy_byte_count: i64,
+) -> i64 {
+    if stream_byte_count == 0 && stream_path.is_some() && legacy_byte_count > 0 {
+        legacy_byte_count
+    } else {
+        stream_byte_count
+    }
 }
 
 fn map_transcript_row(row: &Row<'_>) -> rusqlite::Result<Transcript> {
@@ -2434,13 +2978,15 @@ fn map_processing_job_row(row: &Row<'_>) -> rusqlite::Result<ProcessingJob> {
 }
 
 fn map_capture_selection_row(row: &Row<'_>) -> rusqlite::Result<CaptureSelection> {
-    let include_microphone: i64 = row.get(2)?;
+    let audio_mode = enum_from_column(row, 3, "CaptureAudioMode", CaptureAudioMode::from_db)?;
 
     Ok(CaptureSelection {
-        screen_source_id: row.get(0)?,
-        microphone_device_id: row.get(1)?,
-        include_microphone: include_microphone == 1,
-        updated_at: row.get(3)?,
+        video_source_id: row.get(0)?,
+        screen_source_id: row.get(1)?,
+        microphone_device_id: row.get(2)?,
+        include_microphone: audio_mode.includes_microphone(),
+        audio_mode,
+        updated_at: row.get(5)?,
     })
 }
 
@@ -2481,8 +3027,10 @@ fn path_to_string(path: &Path) -> String {
 
 fn default_capture_selection() -> CaptureSelection {
     CaptureSelection {
+        video_source_id: None,
         screen_source_id: None,
         microphone_device_id: None,
+        audio_mode: CaptureAudioMode::Microphone,
         include_microphone: true,
         updated_at: None,
     }
@@ -2881,23 +3429,29 @@ mod tests {
             .expect("default capture selection");
 
         assert!(default_selection.include_microphone);
+        assert_eq!(default_selection.audio_mode, CaptureAudioMode::Microphone);
+        assert!(default_selection.video_source_id.is_none());
         assert!(default_selection.screen_source_id.is_none());
         assert!(default_selection.microphone_device_id.is_none());
         assert!(default_selection.updated_at.is_none());
 
         let saved = state
             .save_capture_selection(SaveCaptureSelectionInput {
+                video_source_id: Some("display:42".to_owned()),
                 screen_source_id: Some("display:42".to_owned()),
                 microphone_device_id: Some("coreaudio:default-input".to_owned()),
+                audio_mode: Some(CaptureAudioMode::Microphone),
                 include_microphone: Some(true),
             })
             .expect("save capture selection");
 
+        assert_eq!(saved.video_source_id.as_deref(), Some("display:42"));
         assert_eq!(saved.screen_source_id.as_deref(), Some("display:42"));
         assert_eq!(
             saved.microphone_device_id.as_deref(),
             Some("coreaudio:default-input")
         );
+        assert_eq!(saved.audio_mode, CaptureAudioMode::Microphone);
         assert!(saved.include_microphone);
         assert!(saved.updated_at.is_some());
 
@@ -2906,8 +3460,269 @@ mod tests {
             .get_capture_selection()
             .expect("load capture selection");
 
+        assert_eq!(loaded.video_source_id, saved.video_source_id);
         assert_eq!(loaded.screen_source_id, saved.screen_source_id);
         assert_eq!(loaded.microphone_device_id, saved.microphone_device_id);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn reads_legacy_screen_source_selection_as_video_source() {
+        let (state, root) = test_state();
+        let connection = state.open_connection().expect("open connection");
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO capture_preferences (
+                    id, screen_source_id, microphone_device_id, include_microphone, updated_at
+                ) VALUES (1, ?1, ?2, 1, ?3)
+                "#,
+                params!["display:7", "coreaudio:legacy-input", "1234"],
+            )
+            .expect("insert legacy capture preference");
+
+        let loaded = state
+            .get_capture_selection()
+            .expect("load legacy capture selection");
+
+        assert_eq!(loaded.video_source_id.as_deref(), Some("display:7"));
+        assert_eq!(loaded.screen_source_id.as_deref(), Some("display:7"));
+        assert_eq!(
+            loaded.microphone_device_id.as_deref(),
+            Some("coreaudio:legacy-input")
+        );
+        assert_eq!(loaded.audio_mode, CaptureAudioMode::Microphone);
+        assert!(loaded.include_microphone);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn persists_source_audio_mode_without_overloading_microphone() {
+        let (state, root) = test_state();
+        let saved = state
+            .save_capture_selection(SaveCaptureSelectionInput {
+                video_source_id: Some("window:9".to_owned()),
+                screen_source_id: None,
+                microphone_device_id: None,
+                audio_mode: Some(CaptureAudioMode::Source),
+                include_microphone: Some(true),
+            })
+            .expect("save source audio selection");
+
+        assert_eq!(saved.video_source_id.as_deref(), Some("window:9"));
+        assert_eq!(saved.screen_source_id.as_deref(), Some("window:9"));
+        assert_eq!(saved.audio_mode, CaptureAudioMode::Source);
+        assert!(!saved.include_microphone);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn prepares_separate_audio_files_for_each_audio_mode() {
+        let (state, root) = test_state();
+
+        let none = state
+            .prepare_recording_session_files("session-none", &CaptureAudioMode::None)
+            .expect("prepare no-audio files");
+        assert!(none.audio_path_relative.is_none());
+        assert!(none.microphone_audio_path_relative.is_none());
+        assert!(none.source_audio_path_relative.is_none());
+
+        let microphone = state
+            .prepare_recording_session_files("session-mic", &CaptureAudioMode::Microphone)
+            .expect("prepare microphone files");
+        assert_eq!(
+            microphone.audio_path_relative,
+            microphone.microphone_audio_path_relative
+        );
+        assert!(microphone
+            .microphone_audio_path_relative
+            .as_deref()
+            .is_some_and(|path| path.ends_with("/microphone.pcm")));
+        assert!(microphone.source_audio_path_relative.is_none());
+
+        let source = state
+            .prepare_recording_session_files("session-source", &CaptureAudioMode::Source)
+            .expect("prepare source-audio files");
+        assert!(source.audio_path_relative.is_none());
+        assert!(source.microphone_audio_path_relative.is_none());
+        assert!(source
+            .source_audio_path_relative
+            .as_deref()
+            .is_some_and(|path| path.ends_with("/source_audio.pcm")));
+
+        let combined = state
+            .prepare_recording_session_files("session-both", &CaptureAudioMode::MicrophoneAndSource)
+            .expect("prepare combined audio files");
+        assert!(combined
+            .microphone_audio_path_relative
+            .as_deref()
+            .is_some_and(|path| path.ends_with("/microphone.pcm")));
+        assert!(combined
+            .source_audio_path_relative
+            .as_deref()
+            .is_some_and(|path| path.ends_with("/source_audio.pcm")));
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn persists_split_recording_session_audio_metadata() {
+        let (state, root) = test_state();
+        let recording = state
+            .create_recording(CreateRecordingInput {
+                title: Some("Split audio".to_owned()),
+                captured_at: Some("1234".to_owned()),
+                media_path: None,
+            })
+            .expect("create recording");
+        let files = state
+            .prepare_recording_session_files(
+                "split-session",
+                &CaptureAudioMode::MicrophoneAndSource,
+            )
+            .expect("prepare split session files");
+
+        let session = state
+            .create_recording_session(CreateRecordingSessionInput {
+                id: "split-session".to_owned(),
+                recording_id: recording.id.clone(),
+                temp_directory: files.temp_directory_relative,
+                video_path: files.video_path_relative,
+                audio_path: files.audio_path_relative.clone(),
+                metadata_path: files.metadata_path_relative,
+                video_source_id: "window:42".to_owned(),
+                screen_source_id: "window:42".to_owned(),
+                video_source_kind: "window".to_owned(),
+                video_source_title: "Match window".to_owned(),
+                video_source_app_name: Some("Metafy".to_owned()),
+                video_source_process_id: Some(123),
+                video_source_window_id: Some(42),
+                microphone_device_id: Some("mic:1".to_owned()),
+                include_microphone: true,
+                audio_mode: CaptureAudioMode::MicrophoneAndSource,
+                microphone_audio_path: files.microphone_audio_path_relative.clone(),
+                source_audio_path: files.source_audio_path_relative.clone(),
+                width: Some(1280),
+                height: Some(720),
+                frame_rate: 30,
+                audio_sample_rate: Some(48_000),
+                audio_channels: Some(2),
+                audio_sample_format: Some("f32".to_owned()),
+                microphone_audio_sample_rate: Some(48_000),
+                microphone_audio_channels: Some(2),
+                microphone_audio_sample_format: Some("f32".to_owned()),
+                source_audio_sample_rate: Some(48_000),
+                source_audio_channels: Some(2),
+                source_audio_sample_format: Some("f32".to_owned()),
+                started_at: "1234".to_owned(),
+            })
+            .expect("create split session");
+
+        let finished = state
+            .finish_recording_session(FinishRecordingSessionInput {
+                id: session.id,
+                status: RecordingSessionStatus::Stopped,
+                width: Some(1280),
+                height: Some(720),
+                frame_count: 10,
+                audio_byte_count: 120,
+                audio_sample_rate: Some(48_000),
+                audio_channels: Some(2),
+                audio_sample_format: Some("f32".to_owned()),
+                microphone_audio_byte_count: 120,
+                microphone_audio_sample_rate: Some(48_000),
+                microphone_audio_channels: Some(2),
+                microphone_audio_sample_format: Some("f32".to_owned()),
+                source_audio_byte_count: 240,
+                source_audio_sample_rate: Some(48_000),
+                source_audio_channels: Some(2),
+                source_audio_sample_format: Some("f32".to_owned()),
+                stopped_at: "1235".to_owned(),
+                duration_ms: 1_000,
+                failure_message: None,
+            })
+            .expect("finish split session");
+
+        assert_eq!(finished.video_source_id, "window:42");
+        assert_eq!(finished.audio_mode, CaptureAudioMode::MicrophoneAndSource);
+        assert_eq!(finished.audio_path, files.audio_path_relative);
+        assert_eq!(
+            finished.microphone_audio_path,
+            files.microphone_audio_path_relative
+        );
+        assert_eq!(finished.source_audio_path, files.source_audio_path_relative);
+        assert_eq!(finished.audio_byte_count, 120);
+        assert_eq!(finished.microphone_audio_byte_count, 120);
+        assert_eq!(finished.source_audio_byte_count, 240);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn reads_legacy_audio_path_as_microphone_audio() {
+        let (state, root) = test_state();
+        let recording = state
+            .create_recording(CreateRecordingInput {
+                title: Some("Legacy audio".to_owned()),
+                captured_at: Some("1234".to_owned()),
+                media_path: None,
+            })
+            .expect("create recording");
+        let connection = state.open_connection().expect("open connection");
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO recording_sessions (
+                    id, recording_id, status, temp_directory, video_path, audio_path,
+                    metadata_path, screen_source_id, microphone_device_id, include_microphone,
+                    width, height, frame_rate, frame_count, audio_byte_count,
+                    audio_sample_rate, audio_channels, audio_sample_format,
+                    started_at, created_at, updated_at
+                ) VALUES (
+                    ?1, ?2, 'stopped', ?3, ?4, ?5,
+                    ?6, ?7, ?8, 1,
+                    640, 480, 30, 5, 96,
+                    48000, 2, 'f32',
+                    '1234', '1234', '1235'
+                )
+                "#,
+                params![
+                    "legacy-session",
+                    recording.id,
+                    "temp/recording-sessions/legacy-session",
+                    "temp/recording-sessions/legacy-session/screen_frames.mfrv",
+                    "temp/recording-sessions/legacy-session/audio.pcm",
+                    "temp/recording-sessions/legacy-session/session.json",
+                    "display:7",
+                    "mic:legacy",
+                ],
+            )
+            .expect("insert legacy session row");
+
+        let loaded = state
+            .get_recording_session("legacy-session")
+            .expect("load legacy session")
+            .expect("legacy session");
+
+        assert_eq!(loaded.video_source_id, "display:7");
+        assert_eq!(loaded.audio_mode, CaptureAudioMode::Microphone);
+        assert_eq!(
+            loaded.microphone_audio_path.as_deref(),
+            Some("temp/recording-sessions/legacy-session/audio.pcm")
+        );
+        assert!(loaded.source_audio_path.is_none());
+        assert_eq!(loaded.microphone_audio_byte_count, 96);
+        assert_eq!(loaded.microphone_audio_sample_rate, Some(48_000));
+        assert_eq!(loaded.microphone_audio_channels, Some(2));
+        assert_eq!(
+            loaded.microphone_audio_sample_format.as_deref(),
+            Some("f32")
+        );
 
         cleanup(root);
     }

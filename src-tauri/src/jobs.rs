@@ -136,6 +136,8 @@ pub fn enqueue_encoding_job(
                         "sessionId": session.id,
                         "videoPath": session.video_path,
                         "audioPath": session.audio_path,
+                        "microphoneAudioPath": session.microphone_audio_path,
+                        "sourceAudioPath": session.source_audio_path,
                     })
                     .to_string(),
                 ),
@@ -802,8 +804,17 @@ fn cleanup_recording_files(
     } else {
         preserved_paths.push(path_to_string(&temp_directory));
         preserved_paths.push(path_to_string(&storage.resolve_path(&session.video_path)));
-        if let Some(audio_path) = session.audio_path.as_deref() {
-            preserved_paths.push(path_to_string(&storage.resolve_path(audio_path)));
+        if let Some(path) = session.microphone_audio_path.as_deref() {
+            preserved_paths.push(path_to_string(&storage.resolve_path(path)));
+        }
+        if let Some(path) = session.source_audio_path.as_deref() {
+            preserved_paths.push(path_to_string(&storage.resolve_path(path)));
+        }
+        if let Some(path) = session.audio_path.as_deref() {
+            let legacy_audio_path = path_to_string(&storage.resolve_path(path));
+            if !preserved_paths.contains(&legacy_audio_path) {
+                preserved_paths.push(legacy_audio_path);
+            }
         }
         preserved_paths.push(path_to_string(
             &storage.resolve_path(&session.metadata_path),
@@ -840,6 +851,14 @@ fn mark_interrupted_captures(storage: &StorageState) -> Result<usize, String> {
                 audio_sample_rate: session.audio_sample_rate,
                 audio_channels: session.audio_channels,
                 audio_sample_format: session.audio_sample_format,
+                microphone_audio_byte_count: session.microphone_audio_byte_count,
+                microphone_audio_sample_rate: session.microphone_audio_sample_rate,
+                microphone_audio_channels: session.microphone_audio_channels,
+                microphone_audio_sample_format: session.microphone_audio_sample_format,
+                source_audio_byte_count: session.source_audio_byte_count,
+                source_audio_sample_rate: session.source_audio_sample_rate,
+                source_audio_channels: session.source_audio_channels,
+                source_audio_sample_format: session.source_audio_sample_format,
                 stopped_at: stopped_at.clone(),
                 duration_ms: session.duration_ms.unwrap_or(0),
                 failure_message: Some(INTERRUPTED_CAPTURE_MESSAGE.to_owned()),

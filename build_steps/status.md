@@ -2,9 +2,9 @@
 
 Last updated: 2026-07-02
 
-Current phase: Step 11 Packaging & Validation
+Current phase: Step 17 Resize Normalization
 
-Overall progress: 95%
+Overall progress: 85%
 
 Overall sign-off: Pending
 
@@ -23,6 +23,13 @@ Overall sign-off: Pending
 | 09 Optional AI Summaries | Implemented | 100% | Ready for Review | [Brief](09_optional_ai_summaries/09_optional_ai_summaries.md) | [Status](09_optional_ai_summaries/status.md) |
 | 10 Failure Recovery & Jobs | Implemented | 100% | Ready for Review | [Brief](10_failure_recovery_jobs/10_failure_recovery_jobs.md) | [Status](10_failure_recovery_jobs/status.md) |
 | 11 Packaging & Validation | In Progress | 50% | Pending | [Brief](11_packaging_validation/11_packaging_validation.md) | [Status](11_packaging_validation/status.md) |
+| 12 Capture Source Model | Implemented | 100% | Approved | [Brief](12_capture_source_model/12_capture_source_model.md) | [Status](12_capture_source_model/status.md) |
+| 13 Source Picker & Audio Mode UI | Implemented | 100% | Approved | [Brief](13_source_picker_ui/13_source_picker_ui.md) | [Status](13_source_picker_ui/status.md) |
+| 14 Application & Window Video Capture | Implemented | 100% | Approved | [Brief](14_application_window_video_capture/14_application_window_video_capture.md) | [Status](14_application_window_video_capture/status.md) |
+| 15 Source Audio Backends | Implemented | 100% | Approved | [Brief](15_source_audio_backends/15_source_audio_backends.md) | [Status](15_source_audio_backends/status.md) |
+| 16 Split Audio Session Storage | Implemented | 100% | Approved | [Brief](16_split_audio_session_storage/16_split_audio_session_storage.md) | [Status](16_split_audio_session_storage/status.md) |
+| 17 Resize Normalization | Implemented | 100% | Ready for Review | [Brief](17_resize_normalization/17_resize_normalization.md) | [Status](17_resize_normalization/status.md) |
+| 18 Multi-Input Encoding & Validation | Not Started | 0% | Pending | [Brief](18_multi_input_encoding_validation/18_multi_input_encoding_validation.md) | [Status](18_multi_input_encoding_validation/status.md) |
 
 ## Milestone Gates
 
@@ -37,12 +44,18 @@ Overall sign-off: Pending
 - [ ] Step 09 approved: optional AI is transcript-only and locally stored.
 - [ ] Step 10 approved: jobs and recovery behavior are durable.
 - [ ] Step 11 approved: MVP packaging and validation are complete.
+- [x] Step 12 approved: capture sources are modeled consistently.
+- [x] Step 13 approved: users can configure source and audio modes.
+- [x] Step 14 approved: macOS and Windows application/window video capture works.
+- [x] Step 15 approved: source audio capture works separately from microphone audio.
+- [x] Step 16 approved: microphone and source audio are stored separately.
+- [ ] Step 17 approved: window resize normalization is reliable.
+- [ ] Step 18 approved: multi-input encoding and platform validation are complete.
 
 ## Current Focus
 
-Step 11 packaging validation is in progress. The macOS release app bundle builds
-successfully, packaging notes and manual validation checklists exist, and
-hardware/offline packaged-app validation remains pending.
+Step 17 resize normalization is implemented and ready for review.
+Step 18 multi-input encoding and validation remains next after Step 17 approval.
 
 ## Recent Updates
 
@@ -59,6 +72,26 @@ hardware/offline packaged-app validation remains pending.
 - 2026-07-01: Implemented Step 08 local search with a SQLite FTS5 transcript segment index, search/reindex commands, timestamped ranked results, and search-result playback seeking.
 - 2026-07-02: Implemented Step 10 failure recovery and jobs with persisted retry/interruption metadata, startup recovery, queued worker execution, retry/cleanup commands, substep job rows, and UI recovery actions.
 - 2026-07-02: Started Step 11 packaging validation with a release app bundle task, macOS `.app` build evidence, FFmpeg/Whisper resource audit, platform packaging notes, and a packaged-app manual validation checklist.
+- 2026-07-02: Added Steps 12-18 for expanded macOS/Windows application and window capture, separate microphone/source audio, resize normalization, and multi-input encoding validation.
+- 2026-07-02: Implemented Step 12 capture source model with source-oriented capture payloads, prefixed source id parsing, video-source/audio-mode preferences, stale-source validation, and legacy `screen_source_id` compatibility.
+- 2026-07-02: Implemented Step 13 source picker and audio-mode UI with grouped source options, mode-specific disabled states, stale-source recovery, separate mic/source live indicators, and validation evidence.
+- 2026-07-02: Advanced Step 14 with generic display/window video target resolution, selected-window capture validation, source metadata in recording sessions, explicit application-capture constraints, and automated validation evidence.
+- 2026-07-02: Andrew approved Step 14 Application & Window Video Capture.
+- 2026-07-02: Advanced Step 15 with a source-audio backend abstraction,
+  macOS ScreenCaptureKit source-audio capture through `scap`, explicit Windows
+  WASAPI system-loopback fallback labeling, source-only raw PCM capture, and
+  automated validation evidence.
+- 2026-07-02: Andrew approved Step 15 Source Audio Backends.
+- 2026-07-02: Implemented Step 16 split audio session storage with schema
+  version 10, explicit video source/audio mode session fields, separate
+  microphone/source PCM sidecars and metrics, legacy `audio_path` compatibility,
+  failure-recovery preservation of both sidecars, and automated validation
+  evidence.
+- 2026-07-02: Andrew approved Step 16 Split Audio Session Storage.
+- 2026-07-02: Implemented Step 17 resize normalization with locked output
+  canvas selection, BGRA scale-to-fit normalization before `.mfrv` writes,
+  centered opaque-black padding, source-dimension metadata, and automated
+  recorder/library test coverage.
 
 ## Sign-Off Notes
 

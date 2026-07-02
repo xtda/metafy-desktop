@@ -2176,9 +2176,9 @@ name = "metafy-desktop"
 version = "0.1.0"
 dependencies = [
  "cpal",
- "open-gpui-scap",
  "reqwest 0.12.28",
  "rusqlite",
+ "scap",
  "serde",
  "serde_json",
  "tauri",
@@ -2615,27 +2615,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "open-gpui-scap"
-version = "0.1.0-beta.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6515820293f6d6781eb4283fd6b4686b480cc1f6b4a5e929e834bf3c939d34b"
-dependencies = [
- "anyhow",
- "cidre",
- "cocoa",
- "core-graphics-helmer-fork",
- "dbus",
- "futures",
- "objc",
- "pipewire",
- "rand 0.8.6",
- "sysinfo",
- "thiserror 2.0.18",
- "windows 0.58.0",
- "windows-capture",
-]
 
 [[package]]
 name = "option-ext"
@@ -3337,6 +3316,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scap"
+version = "0.1.0-beta.1"
+dependencies = [
+ "cidre",
+ "cocoa",
+ "core-graphics-helmer-fork",
+ "cpal",
+ "dbus",
+ "futures",
+ "objc",
+ "pipewire",
+ "rand 0.8.6",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "windows 0.58.0",
+ "windows-capture",
 ]
 
 [[package]]

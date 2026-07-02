@@ -392,7 +392,7 @@ pub fn start_recording_session(
     let capture_config = crate::capture::validate_capture_config(selection)?;
     let session_id = Uuid::new_v4().to_string();
     let files = storage
-        .prepare_recording_session_files(&session_id, capture_config.include_microphone)
+        .prepare_recording_session_files(&session_id, &capture_config.audio.mode)
         .map_err(command_error)?;
     let started_at = crate::recorder::current_timestamp_string();
     let recording = storage
@@ -423,18 +423,33 @@ pub fn start_recording_session(
             video_path: files.video_path_relative.clone(),
             audio_path: files.audio_path_relative.clone(),
             metadata_path: files.metadata_path_relative.clone(),
-            screen_source_id: capture_config.screen_source.id.clone(),
+            video_source_id: capture_config.video_source.id.clone(),
+            screen_source_id: capture_config.video_source.id.clone(),
+            video_source_kind: capture_config.video_source.kind.label().to_owned(),
+            video_source_title: capture_config.video_source.title.clone(),
+            video_source_app_name: capture_config.video_source.app_name.clone(),
+            video_source_process_id: capture_config.video_source.process_id.map(i64::from),
+            video_source_window_id: capture_config.video_source.window_id.map(i64::from),
             microphone_device_id: capture_config
                 .microphone
                 .as_ref()
                 .map(|microphone| microphone.id.clone()),
             include_microphone: capture_config.include_microphone,
+            audio_mode: capture_config.audio.mode.clone(),
+            microphone_audio_path: files.microphone_audio_path_relative.clone(),
+            source_audio_path: files.source_audio_path_relative.clone(),
             width: None,
             height: None,
             frame_rate: crate::recorder::frame_rate(),
             audio_sample_rate: None,
             audio_channels: None,
             audio_sample_format: None,
+            microphone_audio_sample_rate: None,
+            microphone_audio_channels: None,
+            microphone_audio_sample_format: None,
+            source_audio_sample_rate: None,
+            source_audio_channels: None,
+            source_audio_sample_format: None,
             started_at,
         })
         .map_err(command_error)?;
@@ -445,15 +460,23 @@ pub fn start_recording_session(
     }
 
     match runtime.start(&session, &capture_config, files.clone()) {
-        Ok((width, height, audio_config)) => {
+        Ok(started) => {
+            let microphone_audio_config = started.microphone_audio_config.as_ref();
+            let source_audio_config = started.source_audio_config.as_ref();
             session = storage
                 .update_recording_session_capture_details(
                     &session.id,
-                    width,
-                    height,
-                    audio_config.as_ref().map(|config| config.sample_rate),
-                    audio_config.as_ref().map(|config| config.channels),
-                    audio_config.map(|config| config.sample_format),
+                    started.width,
+                    started.height,
+                    microphone_audio_config.map(|config| config.sample_rate),
+                    microphone_audio_config.map(|config| config.channels),
+                    microphone_audio_config.map(|config| config.sample_format.clone()),
+                    microphone_audio_config.map(|config| config.sample_rate),
+                    microphone_audio_config.map(|config| config.channels),
+                    microphone_audio_config.map(|config| config.sample_format.clone()),
+                    source_audio_config.map(|config| config.sample_rate),
+                    source_audio_config.map(|config| config.channels),
+                    source_audio_config.map(|config| config.sample_format.clone()),
                 )
                 .map_err(command_error)?;
             crate::recorder::write_session_metadata(&files.metadata_path, &session)?;
@@ -480,7 +503,10 @@ pub fn stop_recording_session(
     runtime: State<'_, RecordingRuntime>,
 ) -> Result<RecordingSessionEnvelope, String> {
     let stopped = runtime.stop(input.recording_id.as_deref())?;
-    let audio_config = stopped.audio_config.clone();
+    let microphone_audio_config = stopped.microphone_audio_config.clone();
+    let source_audio_config = stopped.source_audio_config.clone();
+    let microphone_audio_config = microphone_audio_config.as_ref();
+    let source_audio_config = source_audio_config.as_ref();
     let session = storage
         .finish_recording_session(FinishRecordingSessionInput {
             id: stopped.session_id,
@@ -488,10 +514,20 @@ pub fn stop_recording_session(
             width: stopped.width,
             height: stopped.height,
             frame_count: stopped.frame_count,
-            audio_byte_count: stopped.audio_byte_count,
-            audio_sample_rate: audio_config.as_ref().map(|config| config.sample_rate),
-            audio_channels: audio_config.as_ref().map(|config| config.channels),
-            audio_sample_format: audio_config.map(|config| config.sample_format),
+            audio_byte_count: stopped.microphone_audio_byte_count,
+            audio_sample_rate: microphone_audio_config.map(|config| config.sample_rate),
+            audio_channels: microphone_audio_config.map(|config| config.channels),
+            audio_sample_format: microphone_audio_config.map(|config| config.sample_format.clone()),
+            microphone_audio_byte_count: stopped.microphone_audio_byte_count,
+            microphone_audio_sample_rate: microphone_audio_config.map(|config| config.sample_rate),
+            microphone_audio_channels: microphone_audio_config.map(|config| config.channels),
+            microphone_audio_sample_format: microphone_audio_config
+                .map(|config| config.sample_format.clone()),
+            source_audio_byte_count: stopped.source_audio_byte_count,
+            source_audio_sample_rate: source_audio_config.map(|config| config.sample_rate),
+            source_audio_channels: source_audio_config.map(|config| config.channels),
+            source_audio_sample_format: source_audio_config
+                .map(|config| config.sample_format.clone()),
             stopped_at: stopped.stopped_at.clone(),
             duration_ms: stopped.duration_ms,
             failure_message: stopped.failure_message.clone(),
@@ -516,7 +552,14 @@ pub fn stop_recording_session(
         })
         .map_err(command_error)?;
 
-    crate::recorder::write_session_metadata(&stopped.files.metadata_path, &session)?;
+    crate::recorder::write_session_metadata_with_source_dimensions(
+        &stopped.files.metadata_path,
+        &session,
+        Some(crate::recorder::VideoSourceDimensions {
+            width: stopped.source_width,
+            height: stopped.source_height,
+        }),
+    )?;
 
     if session.status == RecordingSessionStatus::Stopped {
         recording = crate::jobs::enqueue_encoding_job(&storage, &recording.id)?;
@@ -540,7 +583,9 @@ pub fn active_recording_session(
         .ok_or_else(|| "The active recording session metadata is missing.".to_owned())?;
 
     session.frame_count = snapshot.frame_count;
-    session.audio_byte_count = snapshot.audio_byte_count;
+    session.audio_byte_count = snapshot.microphone_audio_byte_count;
+    session.microphone_audio_byte_count = snapshot.microphone_audio_byte_count;
+    session.source_audio_byte_count = snapshot.source_audio_byte_count;
     session.width = snapshot.width.or(session.width);
     session.height = snapshot.height.or(session.height);
     session.duration_ms = Some(snapshot.duration_ms);
@@ -600,6 +645,14 @@ fn fail_created_recording_session(
             audio_sample_rate: None,
             audio_channels: None,
             audio_sample_format: None,
+            microphone_audio_byte_count: 0,
+            microphone_audio_sample_rate: None,
+            microphone_audio_channels: None,
+            microphone_audio_sample_format: None,
+            source_audio_byte_count: 0,
+            source_audio_sample_rate: None,
+            source_audio_channels: None,
+            source_audio_sample_format: None,
             stopped_at: stopped_at.clone(),
             duration_ms: 0,
             failure_message: Some(error.clone()),

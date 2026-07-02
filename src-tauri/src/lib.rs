@@ -6,6 +6,7 @@ mod config;
 mod encoding;
 mod jobs;
 mod recorder;
+mod source_audio;
 mod storage;
 mod transcription;
 

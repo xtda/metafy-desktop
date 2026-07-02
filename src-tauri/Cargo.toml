@@ -25,4 +25,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 cpal = "0.18.1"
-scap = { package = "open-gpui-scap", version = "0.1.0-beta.1" }
+scap = "0.1.0-beta.1"
+
+[patch.crates-io]
+scap = { path = "vendor/scap" }
