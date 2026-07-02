@@ -314,7 +314,7 @@ impl RecordingRuntime {
         }
 
         let screen_handle = spawn_screen_writer(
-            capturer,
+            config.video_source.id.clone(),
             video_file,
             output_canvas,
             Arc::clone(&stop_signal),
@@ -662,7 +662,7 @@ impl OutputCanvas {
 }
 
 fn spawn_screen_writer(
-    mut capturer: scap::capturer::Capturer,
+    source_id: String,
     file: File,
     output_canvas: OutputCanvas,
     stop_signal: Arc<AtomicBool>,
@@ -670,6 +670,13 @@ fn spawn_screen_writer(
     started_instant: Instant,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let mut capturer = match build_video_capturer(&source_id) {
+            Ok(capturer) => capturer,
+            Err(error) => {
+                push_error(&stats, error);
+                return;
+            }
+        };
         let mut writer = BufWriter::new(file);
         if let Err(error) = writer.write_all(VIDEO_FILE_MAGIC) {
             push_error(
@@ -1086,13 +1093,20 @@ fn build_source_audio_runtime(
     stop_signal: Arc<AtomicBool>,
     started_instant: Instant,
 ) -> Result<SourceAudioRuntime, String> {
-    let mut capturer = crate::source_audio::build_source_audio_capturer(config)?;
     let file = File::create(audio_path)
         .map_err(|error| format!("Unable to create source audio capture file: {error}"))?;
     let runtime_config = Arc::new(Mutex::new(None));
     let writer_config = Arc::clone(&runtime_config);
     let writer_stats = Arc::clone(&stats);
+    let capture_config = config.clone();
     let writer_handle = thread::spawn(move || {
+        let mut capturer = match crate::source_audio::build_source_audio_capturer(&capture_config) {
+            Ok(capturer) => capturer,
+            Err(error) => {
+                push_error(&writer_stats, error);
+                return;
+            }
+        };
         let mut writer = BufWriter::new(file);
         if let Err(error) = writer.write_all(AUDIO_FILE_MAGIC) {
             push_error(

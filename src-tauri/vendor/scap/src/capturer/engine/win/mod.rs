@@ -76,7 +76,7 @@ impl GraphicsCaptureApiHandler for Capturer {
         frame: &mut WCFrame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let elapsed = frame.timespan().Duration - self.start_time.0;
+        let elapsed = frame.timestamp().Duration - self.start_time.0;
         let display_time = self
             .start_time
             .1
@@ -178,8 +178,8 @@ struct FlagStruct {
 
 #[derive(Debug)]
 pub enum CreateCapturerError {
-    AudioStreamConfig(cpal::DefaultStreamConfigError),
-    BuildAudioStream(cpal::BuildStreamError),
+    AudioStreamConfig(cpal::Error),
+    BuildAudioStream(cpal::Error),
 }
 
 pub fn create_capturer(
@@ -215,10 +215,10 @@ pub fn create_capturer(
             WCMonitor::from_raw_hmonitor(display.raw_handle.0),
             show_cursor,
             draw_border,
-            color_format,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
+            color_format,
             FlagStruct {
                 tx: tx.clone(),
                 crop: Some(get_crop_area(options)),
@@ -343,14 +343,14 @@ enum AudioStreamControl {
 
 fn build_audio_stream(
     sample_tx: mpsc::Sender<
-        Result<(Vec<u8>, cpal::InputCallbackInfo, SystemTime), cpal::StreamError>,
+        Result<(Vec<u8>, cpal::InputCallbackInfo, SystemTime), cpal::Error>,
     >,
 ) -> Result<(cpal::Stream, cpal::SupportedStreamConfig), CreateCapturerError> {
     let host = cpal::default_host();
     let output_device =
         host.default_output_device()
             .ok_or(CreateCapturerError::AudioStreamConfig(
-                cpal::DefaultStreamConfigError::DeviceNotAvailable,
+                cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
             ))?;
     let supported_config = output_device
         .default_output_config()
@@ -359,7 +359,7 @@ fn build_audio_stream(
 
     let stream = output_device
         .build_input_stream_raw(
-            &config,
+            config,
             supported_config.sample_format(),
             {
                 let sample_tx = sample_tx.clone();
@@ -441,7 +441,7 @@ fn spawn_audio_stream(
                 false,
                 data,
                 sample_count,
-                config.sample_rate().0,
+                config.sample_rate(),
                 timestamp,
             );
 

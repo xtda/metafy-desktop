@@ -718,6 +718,10 @@
     }
   },
   "workspace": {
+    "dependencies": [
+      "npm:@sveltejs/adapter-static@^3.0.6",
+      "npm:@sveltejs/vite-plugin-svelte@5"
+    ],
     "packageJson": {
       "dependencies": [
         "npm:@sveltejs/adapter-static@^3.0.6",
