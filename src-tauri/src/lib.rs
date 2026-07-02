@@ -17,6 +17,9 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let storage = storage::initialize(app.handle())?;
+            if let Err(error) = binaries::initialize_bundled_binaries(app.handle()) {
+                eprintln!("bundled binary setup failed: {error}");
+            }
             if let Err(error) = jobs::recover_on_startup(&storage) {
                 eprintln!("processing job recovery failed: {error}");
             }

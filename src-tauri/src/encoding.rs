@@ -6,11 +6,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::binaries::{find_binary, missing_binary_message};
-use crate::storage::{RecordingSession, StorageState};
+use crate::storage::{CaptureAudioMode, RecordingSession, StorageState};
 
 const VIDEO_FILE_MAGIC: &[u8] = b"METAFY_RAW_VIDEO_V1\n";
 const AUDIO_FILE_MAGIC: &[u8] = b"METAFY_RAW_AUDIO_V1\n";
 const BGRA_FORMAT_CODE: u32 = 7;
+const LEGACY_STAGING_AUDIO_FILE_NAME: &str = "encoding-audio.raw";
+const MICROPHONE_STAGING_AUDIO_FILE_NAME: &str = "encoding-microphone.raw";
+const SOURCE_STAGING_AUDIO_FILE_NAME: &str = "encoding-source.raw";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,9 +50,17 @@ struct PreparedAudio {
 struct EncodingAudioInput {
     path: PathBuf,
     label: &'static str,
+    staging_file_name: &'static str,
     sample_rate: Option<i64>,
     channels: Option<i64>,
     sample_format: Option<String>,
+}
+
+struct PreparedAudioInput {
+    path: PathBuf,
+    sample_rate: i64,
+    channels: i64,
+    ffmpeg_format: &'static str,
 }
 
 struct CommandOutput {
@@ -75,14 +86,19 @@ pub fn encode_recording(
         .map_err(|error| error.to_string())?;
     let source_video_path = storage.resolve_path(&session.video_path);
     let mut warnings = Vec::new();
-    let encoding_audio = select_encoding_audio_input(storage, &session, &mut warnings);
+    let encoding_audio_inputs = select_encoding_audio_inputs(storage, &session, &mut warnings);
     let staging_video_path = media_files.recording_directory.join("encoding-video.bgra");
-    let staging_audio_path = media_files.recording_directory.join("encoding-audio.raw");
     let staging_media_path = media_files.recording_directory.join("recording.tmp.mp4");
     let staging_thumbnail_path = media_files.recording_directory.join("thumbnail.tmp.jpg");
 
     remove_file_if_exists(&staging_video_path)?;
-    remove_file_if_exists(&staging_audio_path)?;
+    for file_name in [
+        LEGACY_STAGING_AUDIO_FILE_NAME,
+        MICROPHONE_STAGING_AUDIO_FILE_NAME,
+        SOURCE_STAGING_AUDIO_FILE_NAME,
+    ] {
+        remove_file_if_exists(&media_files.recording_directory.join(file_name))?;
+    }
     remove_file_if_exists(&staging_media_path)?;
     remove_file_if_exists(&staging_thumbnail_path)?;
 
@@ -92,36 +108,18 @@ pub fn encode_recording(
         session.width,
         session.height,
     )?;
-    let prepared_audio = match encoding_audio.as_ref() {
-        Some(audio_input) if audio_input.path.exists() => {
-            let audio =
-                prepare_audio_samples(&audio_input.path, &staging_audio_path, audio_input.label)?;
-            if audio.byte_count == 0 {
-                warnings.push(format!(
-                    "{} capture had no audio samples; encoded video only.",
-                    audio_input.label
-                ));
-                None
-            } else {
-                Some(audio)
-            }
+    let mut prepared_audio_inputs = Vec::new();
+    for audio_input in encoding_audio_inputs {
+        let staging_audio_path = media_files
+            .recording_directory
+            .join(audio_input.staging_file_name);
+        if let Some(prepared_audio) =
+            prepare_encoding_audio_input(audio_input, staging_audio_path, &mut warnings)?
+        {
+            prepared_audio_inputs.push(prepared_audio);
         }
-        Some(_) => {
-            warnings.push(format!(
-                "{} capture file was missing; encoded video only.",
-                encoding_audio
-                    .as_ref()
-                    .map(|audio| audio.label)
-                    .unwrap_or("Audio")
-            ));
-            None
-        }
-        None => None,
-    };
-    let audio_included = prepared_audio.is_some();
-    let encoded_audio = prepared_audio
-        .as_ref()
-        .and_then(|_| encoding_audio.as_ref());
+    }
+    let audio_included = !prepared_audio_inputs.is_empty();
 
     let ffmpeg_path = find_binary("METAFY_FFMPEG_PATH", &["ffmpeg"])
         .ok_or_else(|| missing_binary_message("ffmpeg", "METAFY_FFMPEG_PATH"))?;
@@ -131,11 +129,7 @@ pub fn encode_recording(
         prepared_video.width,
         prepared_video.height,
         session.frame_rate,
-        prepared_audio.as_ref().map(|_| &staging_audio_path),
-        encoded_audio.and_then(|audio| audio.sample_rate),
-        encoded_audio.and_then(|audio| audio.channels),
-        encoded_audio.and_then(|audio| audio.sample_format.as_deref()),
-        encoded_audio.map(|audio| audio.label).unwrap_or("Audio"),
+        &prepared_audio_inputs,
         &staging_media_path,
     )?;
     run_logged_command(&encode_command, "FFmpeg encode")?;
@@ -174,7 +168,9 @@ pub fn encode_recording(
     };
 
     let _ = remove_file_if_exists(&staging_video_path);
-    let _ = remove_file_if_exists(&staging_audio_path);
+    for audio_input in &prepared_audio_inputs {
+        let _ = remove_file_if_exists(&audio_input.path);
+    }
 
     Ok(EncodingResult {
         recording_id: recording_id.to_owned(),
@@ -200,53 +196,72 @@ pub fn encode_recording(
     })
 }
 
-fn select_encoding_audio_input(
+fn select_encoding_audio_inputs(
     storage: &StorageState,
     session: &RecordingSession,
     warnings: &mut Vec<String>,
-) -> Option<EncodingAudioInput> {
-    let microphone = session
+) -> Vec<EncodingAudioInput> {
+    let mut inputs = Vec::new();
+    let microphone_path = session
         .microphone_audio_path
         .as_deref()
-        .map(|path| EncodingAudioInput {
-            path: storage.resolve_path(path),
-            label: "microphone audio",
-            sample_rate: session.microphone_audio_sample_rate,
-            channels: session.microphone_audio_channels,
-            sample_format: session.microphone_audio_sample_format.clone(),
-        });
-    let source = session
-        .source_audio_path
-        .as_deref()
-        .map(|path| EncodingAudioInput {
-            path: storage.resolve_path(path),
-            label: "source audio",
-            sample_rate: session.source_audio_sample_rate,
-            channels: session.source_audio_channels,
-            sample_format: session.source_audio_sample_format.clone(),
-        });
+        .or_else(|| legacy_microphone_audio_path(session));
 
-    match (microphone, source) {
-        (Some(microphone), Some(_source)) => {
-            warnings.push(
-                "Source audio was captured separately; final MP4 encoding currently uses microphone audio only."
-                    .to_owned(),
-            );
-            Some(microphone)
-        }
-        (Some(microphone), None) => Some(microphone),
-        (None, Some(source)) => Some(source),
-        (None, None) => session
-            .audio_path
-            .as_deref()
-            .map(|path| EncodingAudioInput {
+    if session.audio_mode.includes_microphone() {
+        if let Some(path) = microphone_path {
+            inputs.push(EncodingAudioInput {
                 path: storage.resolve_path(path),
                 label: "microphone audio",
+                staging_file_name: MICROPHONE_STAGING_AUDIO_FILE_NAME,
+                sample_rate: session.microphone_audio_sample_rate,
+                channels: session.microphone_audio_channels,
+                sample_format: session.microphone_audio_sample_format.clone(),
+            });
+        } else {
+            warnings.push(
+                "microphone audio was requested but no capture file was recorded; encoded without microphone audio."
+                    .to_owned(),
+            );
+        }
+    } else if session.audio_mode == CaptureAudioMode::None {
+        if let Some(path) = legacy_microphone_audio_path(session) {
+            inputs.push(EncodingAudioInput {
+                path: storage.resolve_path(path),
+                label: "microphone audio",
+                staging_file_name: MICROPHONE_STAGING_AUDIO_FILE_NAME,
                 sample_rate: session.audio_sample_rate,
                 channels: session.audio_channels,
                 sample_format: session.audio_sample_format.clone(),
-            }),
+            });
+        }
     }
+
+    if session.audio_mode.includes_source_audio() {
+        if let Some(path) = session.source_audio_path.as_deref() {
+            inputs.push(EncodingAudioInput {
+                path: storage.resolve_path(path),
+                label: "source audio",
+                staging_file_name: SOURCE_STAGING_AUDIO_FILE_NAME,
+                sample_rate: session.source_audio_sample_rate,
+                channels: session.source_audio_channels,
+                sample_format: session.source_audio_sample_format.clone(),
+            });
+        } else {
+            warnings.push(
+                "source audio was requested but no capture file was recorded; encoded without source audio."
+                    .to_owned(),
+            );
+        }
+    }
+
+    inputs
+}
+
+fn legacy_microphone_audio_path(session: &RecordingSession) -> Option<&str> {
+    session
+        .audio_path
+        .as_deref()
+        .filter(|_| session.audio_mode != CaptureAudioMode::Source)
 }
 
 fn prepare_video_frames(
@@ -373,17 +388,69 @@ fn prepare_audio_samples(
     Ok(PreparedAudio { byte_count })
 }
 
+fn prepare_encoding_audio_input(
+    input: EncodingAudioInput,
+    staging_path: PathBuf,
+    warnings: &mut Vec<String>,
+) -> Result<Option<PreparedAudioInput>, String> {
+    if !input.path.exists() {
+        warnings.push(format!(
+            "{} was requested but the capture file was missing; encoded without this source.",
+            input.label
+        ));
+        return Ok(None);
+    }
+
+    let audio = prepare_audio_samples(&input.path, &staging_path, input.label)?;
+    if audio.byte_count == 0 {
+        warnings.push(format!(
+            "{} capture had no audio samples; encoded without this source.",
+            input.label
+        ));
+        let _ = remove_file_if_exists(&staging_path);
+        return Ok(None);
+    }
+
+    let Some(sample_rate) = input.sample_rate.filter(|value| *value > 0) else {
+        warnings.push(format!(
+            "{} sample rate was missing; encoded without this source.",
+            input.label
+        ));
+        let _ = remove_file_if_exists(&staging_path);
+        return Ok(None);
+    };
+    let Some(channels) = input.channels.filter(|value| *value > 0) else {
+        warnings.push(format!(
+            "{} channel count was missing; encoded without this source.",
+            input.label
+        ));
+        let _ = remove_file_if_exists(&staging_path);
+        return Ok(None);
+    };
+    let Some(ffmpeg_format) = input.sample_format.as_deref().and_then(ffmpeg_audio_format) else {
+        warnings.push(format!(
+            "{} sample format was unsupported by the encoder; encoded without this source.",
+            input.label
+        ));
+        let _ = remove_file_if_exists(&staging_path);
+        return Ok(None);
+    };
+
+    Ok(Some(PreparedAudioInput {
+        path: staging_path,
+        sample_rate,
+        channels,
+        ffmpeg_format,
+    }))
+}
+
 fn build_encode_command(
     ffmpeg_path: &Path,
     video_path: &Path,
     width: i64,
     height: i64,
     frame_rate: i64,
-    audio_path: Option<&PathBuf>,
-    audio_sample_rate: Option<i64>,
-    audio_channels: Option<i64>,
-    audio_sample_format: Option<&str>,
-    audio_label: &str,
+    audio_inputs: &[PreparedAudioInput],
     output_path: &Path,
 ) -> Result<CommandOutput, String> {
     let mut args = vec![
@@ -401,35 +468,32 @@ fn build_encode_command(
         path_to_string(video_path),
     ];
 
-    if let Some(audio_path) = audio_path {
-        let sample_rate = audio_sample_rate
-            .filter(|value| *value > 0)
-            .ok_or_else(|| format!("{audio_label} sample rate is missing for audio encoding."))?;
-        let channels = audio_channels
-            .filter(|value| *value > 0)
-            .ok_or_else(|| format!("{audio_label} channel count is missing for audio encoding."))?;
-        let sample_format = audio_sample_format
-            .and_then(ffmpeg_audio_format)
-            .ok_or_else(|| format!("{audio_label} sample format is unsupported by the encoder."))?;
-
+    for audio_input in audio_inputs {
         args.extend([
             "-f".to_owned(),
-            sample_format.to_owned(),
+            audio_input.ffmpeg_format.to_owned(),
             "-ar".to_owned(),
-            sample_rate.to_string(),
+            audio_input.sample_rate.to_string(),
             "-ac".to_owned(),
-            channels.to_string(),
+            audio_input.channels.to_string(),
             "-i".to_owned(),
-            path_to_string(audio_path),
+            path_to_string(&audio_input.path),
+        ]);
+    }
+
+    if audio_inputs.len() > 1 {
+        args.extend([
+            "-filter_complex".to_owned(),
+            mixed_audio_filter(audio_inputs.len()),
         ]);
     }
 
     args.extend(["-map".to_owned(), "0:v:0".to_owned()]);
 
-    if audio_path.is_some() {
-        args.extend(["-map".to_owned(), "1:a:0".to_owned()]);
-    } else {
-        args.push("-an".to_owned());
+    match audio_inputs.len() {
+        0 => args.push("-an".to_owned()),
+        1 => args.extend(["-map".to_owned(), "1:a:0".to_owned()]),
+        _ => args.extend(["-map".to_owned(), "[mixed_audio]".to_owned()]),
     }
 
     args.extend([
@@ -443,7 +507,7 @@ fn build_encode_command(
         "yuv420p".to_owned(),
     ]);
 
-    if audio_path.is_some() {
+    if !audio_inputs.is_empty() {
         args.extend([
             "-c:a".to_owned(),
             "aac".to_owned(),
@@ -462,6 +526,25 @@ fn build_encode_command(
         program: ffmpeg_path.to_path_buf(),
         args,
     })
+}
+
+fn mixed_audio_filter(input_count: usize) -> String {
+    let mut filters = Vec::with_capacity(input_count + 1);
+    for audio_index in 0..input_count {
+        filters.push(format!(
+            "[{}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{}]",
+            audio_index + 1,
+            audio_index
+        ));
+    }
+    let labels = (0..input_count)
+        .map(|audio_index| format!("[a{audio_index}]"))
+        .collect::<String>();
+    let gain = 1.0_f64 / input_count as f64;
+    filters.push(format!(
+        "{labels}amix=inputs={input_count}:duration=longest:dropout_transition=0:normalize=0,volume={gain:.6}[mixed_audio]"
+    ));
+    filters.join(";")
 }
 
 fn build_thumbnail_command(
@@ -630,8 +713,8 @@ mod tests {
     use super::*;
     use crate::recorder;
     use crate::storage::{
-        initialize_at, CreateRecordingInput, CreateRecordingSessionInput,
-        FinishRecordingSessionInput, RecordingSessionStatus,
+        initialize_at, CaptureAudioMode, CreateRecordingInput, CreateRecordingSessionInput,
+        FinishRecordingSessionInput, RecordingSessionStatus, StorageState,
     };
     use uuid::Uuid;
 
@@ -733,6 +816,197 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn encodes_synthetic_capture_across_audio_modes() {
+        if !ffmpeg_supports_libx264() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("metafy-encoding-test-{}", Uuid::new_v4()));
+        let state = initialize_at(root.clone()).expect("initialize test storage");
+        let cases = [
+            ("video-only", CaptureAudioMode::None, false, false),
+            ("microphone-only", CaptureAudioMode::Microphone, true, false),
+            ("source-only", CaptureAudioMode::Source, false, true),
+            (
+                "microphone-and-source",
+                CaptureAudioMode::MicrophoneAndSource,
+                true,
+                true,
+            ),
+        ];
+
+        for (session_id, audio_mode, write_microphone, write_source) in cases {
+            let recording_id = create_finished_synthetic_recording(
+                &state,
+                session_id,
+                audio_mode,
+                write_microphone,
+                write_source,
+            );
+
+            let result = encode_recording(&state, &recording_id).expect("encode recording");
+
+            assert_eq!(result.audio_included, write_microphone || write_source);
+            assert!(Path::new(&result.absolute_media_path).is_file());
+            assert!(
+                !result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("encoded without")),
+                "{:?}",
+                result.warnings
+            );
+            if write_microphone && write_source {
+                assert!(result.ffmpeg_args.contains(&"-filter_complex".to_owned()));
+                assert!(contains_args(
+                    &result.ffmpeg_args,
+                    &["-map", "[mixed_audio]"]
+                ));
+            }
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_encode_command_supports_video_only() {
+        let command = build_encode_command(
+            Path::new("/usr/bin/ffmpeg"),
+            Path::new("/tmp/video.bgra"),
+            1280,
+            720,
+            30,
+            &[],
+            Path::new("/tmp/recording.mp4"),
+        )
+        .expect("build command");
+
+        assert!(contains_args(&command.args, &["-map", "0:v:0"]));
+        assert!(command.args.contains(&"-an".to_owned()));
+        assert!(!command.args.contains(&"-filter_complex".to_owned()));
+        assert!(!command.args.contains(&"-c:a".to_owned()));
+    }
+
+    #[test]
+    fn build_encode_command_supports_single_audio_source() {
+        let audio_inputs = vec![prepared_audio_input(
+            "/tmp/microphone.raw",
+            48_000,
+            2,
+            "f32le",
+        )];
+        let command = build_encode_command(
+            Path::new("/usr/bin/ffmpeg"),
+            Path::new("/tmp/video.bgra"),
+            1280,
+            720,
+            30,
+            &audio_inputs,
+            Path::new("/tmp/recording.mp4"),
+        )
+        .expect("build command");
+
+        assert!(contains_args(
+            &command.args,
+            &[
+                "-f",
+                "f32le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-i",
+                "/tmp/microphone.raw",
+            ]
+        ));
+        assert!(contains_args(&command.args, &["-map", "1:a:0"]));
+        assert!(!command.args.contains(&"-filter_complex".to_owned()));
+        assert!(contains_args(&command.args, &["-c:a", "aac"]));
+    }
+
+    #[test]
+    fn build_encode_command_mixes_microphone_and_source_audio() {
+        let audio_inputs = vec![
+            prepared_audio_input("/tmp/microphone.raw", 48_000, 2, "f32le"),
+            prepared_audio_input("/tmp/source.raw", 44_100, 2, "s16le"),
+        ];
+        let command = build_encode_command(
+            Path::new("/usr/bin/ffmpeg"),
+            Path::new("/tmp/video.bgra"),
+            1280,
+            720,
+            30,
+            &audio_inputs,
+            Path::new("/tmp/recording.mp4"),
+        )
+        .expect("build command");
+
+        let filter = arg_after(&command.args, "-filter_complex").expect("filter");
+
+        assert!(filter.contains(
+            "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a0]"
+        ));
+        assert!(filter.contains(
+            "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a1]"
+        ));
+        assert!(filter.contains(
+            "[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,volume=0.500000[mixed_audio]"
+        ));
+        assert!(contains_args(&command.args, &["-map", "[mixed_audio]"]));
+        assert!(contains_args(&command.args, &["-c:a", "aac"]));
+    }
+
+    #[test]
+    fn prepare_encoding_audio_input_warns_for_missing_silent_and_unsupported_sources() {
+        let root = std::env::temp_dir().join(format!("metafy-audio-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test root");
+
+        let mut warnings = Vec::new();
+        let missing = prepare_encoding_audio_input(
+            encoding_audio_input(root.join("missing.pcm"), "microphone audio", Some("f32")),
+            root.join("missing.raw"),
+            &mut warnings,
+        )
+        .expect("prepare missing audio");
+        assert!(missing.is_none());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("capture file was missing")));
+
+        let silent_path = root.join("silent.pcm");
+        write_synthetic_audio(&silent_path, &[]).expect("write silent audio");
+        let silent_staging_path = root.join("silent.raw");
+        let silent = prepare_encoding_audio_input(
+            encoding_audio_input(silent_path, "source audio", Some("f32")),
+            silent_staging_path.clone(),
+            &mut warnings,
+        )
+        .expect("prepare silent audio");
+        assert!(silent.is_none());
+        assert!(!silent_staging_path.exists());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("had no audio samples")));
+
+        let unsupported_path = root.join("unsupported.pcm");
+        write_synthetic_audio(&unsupported_path, &[&[0, 1, 2, 3]]).expect("write audio");
+        let unsupported_staging_path = root.join("unsupported.raw");
+        let unsupported = prepare_encoding_audio_input(
+            encoding_audio_input(unsupported_path, "source audio", Some("pcm24")),
+            unsupported_staging_path.clone(),
+            &mut warnings,
+        )
+        .expect("prepare unsupported audio");
+        assert!(unsupported.is_none());
+        assert!(!unsupported_staging_path.exists());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("sample format was unsupported")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn ffmpeg_supports_libx264() -> bool {
         Command::new("ffmpeg")
             .args(["-hide_banner", "-encoders"])
@@ -741,6 +1015,173 @@ mod tests {
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).contains("libx264"))
             .unwrap_or(false)
+    }
+
+    fn prepared_audio_input(
+        path: &str,
+        sample_rate: i64,
+        channels: i64,
+        ffmpeg_format: &'static str,
+    ) -> PreparedAudioInput {
+        PreparedAudioInput {
+            path: PathBuf::from(path),
+            sample_rate,
+            channels,
+            ffmpeg_format,
+        }
+    }
+
+    fn create_finished_synthetic_recording(
+        state: &StorageState,
+        session_id: &str,
+        audio_mode: CaptureAudioMode,
+        write_microphone: bool,
+        write_source: bool,
+    ) -> String {
+        let recording = state
+            .create_recording(CreateRecordingInput {
+                title: Some(session_id.to_owned()),
+                captured_at: Some(recorder::current_timestamp_string()),
+                media_path: None,
+            })
+            .expect("create recording");
+        let files = state
+            .prepare_recording_session_files(session_id, &audio_mode)
+            .expect("prepare session files");
+        write_synthetic_video(&files.video_path, 3, 2, 2).expect("write synthetic video");
+
+        let microphone_block = synthetic_f32_stereo_block(480, 0.2);
+        let source_block = synthetic_f32_stereo_block(480, 0.4);
+        if write_microphone {
+            write_synthetic_audio(
+                files
+                    .microphone_audio_path
+                    .as_deref()
+                    .expect("microphone path"),
+                &[microphone_block.as_slice()],
+            )
+            .expect("write microphone audio");
+        }
+        if write_source {
+            write_synthetic_audio(
+                files.source_audio_path.as_deref().expect("source path"),
+                &[source_block.as_slice()],
+            )
+            .expect("write source audio");
+        }
+
+        let session = state
+            .create_recording_session(CreateRecordingSessionInput {
+                id: session_id.to_owned(),
+                recording_id: recording.id.clone(),
+                temp_directory: files.temp_directory_relative,
+                video_path: files.video_path_relative,
+                audio_path: files.audio_path_relative.clone(),
+                metadata_path: files.metadata_path_relative,
+                video_source_id: "display:1".to_owned(),
+                screen_source_id: "display:1".to_owned(),
+                video_source_kind: "display".to_owned(),
+                video_source_title: "Display 1".to_owned(),
+                video_source_app_name: None,
+                video_source_process_id: None,
+                video_source_window_id: None,
+                microphone_device_id: write_microphone.then(|| "mic:1".to_owned()),
+                include_microphone: audio_mode.includes_microphone(),
+                audio_mode,
+                microphone_audio_path: files.microphone_audio_path_relative.clone(),
+                source_audio_path: files.source_audio_path_relative.clone(),
+                width: Some(2),
+                height: Some(2),
+                frame_rate: recorder::frame_rate(),
+                audio_sample_rate: write_microphone.then_some(48_000),
+                audio_channels: write_microphone.then_some(2),
+                audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                microphone_audio_sample_rate: write_microphone.then_some(48_000),
+                microphone_audio_channels: write_microphone.then_some(2),
+                microphone_audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                source_audio_sample_rate: write_source.then_some(48_000),
+                source_audio_channels: write_source.then_some(2),
+                source_audio_sample_format: write_source.then(|| "f32".to_owned()),
+                started_at: recorder::current_timestamp_string(),
+            })
+            .expect("create session");
+        state
+            .finish_recording_session(FinishRecordingSessionInput {
+                id: session.id,
+                status: RecordingSessionStatus::Stopped,
+                width: Some(2),
+                height: Some(2),
+                frame_count: 3,
+                audio_byte_count: if write_microphone {
+                    microphone_block.len() as i64
+                } else {
+                    0
+                },
+                audio_sample_rate: write_microphone.then_some(48_000),
+                audio_channels: write_microphone.then_some(2),
+                audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                microphone_audio_byte_count: if write_microphone {
+                    microphone_block.len() as i64
+                } else {
+                    0
+                },
+                microphone_audio_sample_rate: write_microphone.then_some(48_000),
+                microphone_audio_channels: write_microphone.then_some(2),
+                microphone_audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                source_audio_byte_count: if write_source {
+                    source_block.len() as i64
+                } else {
+                    0
+                },
+                source_audio_sample_rate: write_source.then_some(48_000),
+                source_audio_channels: write_source.then_some(2),
+                source_audio_sample_format: write_source.then(|| "f32".to_owned()),
+                stopped_at: recorder::current_timestamp_string(),
+                duration_ms: 100,
+                failure_message: None,
+            })
+            .expect("finish session");
+
+        recording.id
+    }
+
+    fn synthetic_f32_stereo_block(frame_count: usize, sample: f32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(frame_count * 2 * std::mem::size_of::<f32>());
+        for _frame in 0..frame_count {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn encoding_audio_input(
+        path: PathBuf,
+        label: &'static str,
+        sample_format: Option<&str>,
+    ) -> EncodingAudioInput {
+        EncodingAudioInput {
+            path,
+            label,
+            staging_file_name: MICROPHONE_STAGING_AUDIO_FILE_NAME,
+            sample_rate: Some(48_000),
+            channels: Some(2),
+            sample_format: sample_format.map(str::to_owned),
+        }
+    }
+
+    fn arg_after<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|window| window[0] == name)
+            .map(|window| window[1].as_str())
+    }
+
+    fn contains_args(args: &[String], expected: &[&str]) -> bool {
+        args.windows(expected.len()).any(|window| {
+            window
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+        })
     }
 
     fn write_synthetic_video(
@@ -766,6 +1207,22 @@ mod tests {
             writer.write_all(&height.to_le_bytes())?;
             writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
             writer.write_all(&bytes)?;
+        }
+
+        writer.flush()
+    }
+
+    fn write_synthetic_audio(path: &Path, blocks: &[&[u8]]) -> io::Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        writer.write_all(AUDIO_FILE_MAGIC)?;
+
+        for (block_index, block) in blocks.iter().enumerate() {
+            let elapsed_ns = block_index as u64 * 1_000_000;
+            writer.write_all(&elapsed_ns.to_le_bytes())?;
+            writer.write_all(&elapsed_ns.to_le_bytes())?;
+            writer.write_all(&elapsed_ns.to_le_bytes())?;
+            writer.write_all(&(block.len() as u32).to_le_bytes())?;
+            writer.write_all(block)?;
         }
 
         writer.flush()

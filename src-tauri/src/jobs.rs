@@ -777,6 +777,8 @@ fn cleanup_recording_files(
     for file_name in [
         "encoding-video.bgra",
         "encoding-audio.raw",
+        "encoding-microphone.raw",
+        "encoding-source.raw",
         "recording.tmp.mp4",
         "thumbnail.tmp.jpg",
         "transcript-audio.wav",

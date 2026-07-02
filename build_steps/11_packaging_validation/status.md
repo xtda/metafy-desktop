@@ -24,34 +24,48 @@ Last updated: 2026-07-02
   bundle entrypoint.
 - Added `build_steps/11_packaging_validation/packaging_notes.md` with macOS,
   Windows, Linux, FFmpeg, Whisper, offline, and privacy packaging notes.
-- Added `build_steps/11_packaging_validation/manual_validation_checklist.md`
-  for packaged-app MVP sign-off.
-- Added shared runtime binary discovery in `src-tauri/src/binaries.rs`.
-  FFmpeg, FFprobe, and whisper.cpp now resolve via explicit env var, `PATH`,
-  then common system install locations. This covers Finder-launched macOS apps
-  that do not inherit the Homebrew PATH.
+- Added `build_steps/11_packaging_validation/manual_validation_checklist.md` for
+  packaged-app MVP sign-off.
+- Added shared runtime binary discovery in `src-tauri/src/binaries.rs`. FFmpeg,
+  FFprobe, and whisper.cpp now resolve via explicit env var, extracted bundled
+  tools, `PATH`, then common system install locations. This covers
+  Finder-launched macOS apps that do not inherit the Homebrew PATH.
+- Added optional bundled binary archive support. Tauri now includes
+  `src-tauri/resources/binaries`, and app startup extracts current-platform
+  `.zip` archives into `app-data/tools/v1/<os-arch>` before runtime lookup.
+- Added `deno task binaries:download` and `deno task binaries:download:windows`
+  to populate local Windows x64 FFmpeg and whisper.cpp archives for package
+  testing without committing third-party binaries.
+- `deno task binaries:download -- --platform windows-x86_64 --dry-run` passed.
+  It selected `ffmpeg-n8.1-latest-win64-gpl-8.1.zip` from BtbN and
+  `whisper-bin-x64.zip` from whisper.cpp.
+- `cargo check` passed after adding the bundled archive extractor and `zip`
+  dependency.
+- `cargo test` passed: 43 tests passed, 0 failed.
 - `deno task check` passed with 0 Svelte errors and 0 warnings.
-- `cargo test` passed: 14 tests passed, 0 failed. Coverage includes synthetic
-  FFmpeg MP4/thumbnail encode, local Whisper with fake binaries, transcript
-  parsing, local search, durable job state, storage initialization, and optional
-  AI media guardrails.
-- `deno task build` passed and wrote the static frontend to `build`.
 - `deno task bundle:app` passed and wrote
   `src-tauri/target/release/bundle/macos/Metafy Desktop.app`.
-- Bundle audit: the macOS `.app` is 14M and contains `Info.plist`,
-  `Contents/MacOS/metafy-desktop`, and `Contents/Resources/icon.icns`.
+- Bundle audit: `Contents/Resources/binaries` is present in the generated
+  `.app`, with tracked placeholder directories for macOS, Windows, and Linux
+  archive drops.
+- `deno task build` passed and wrote the static frontend to `build`.
+- Bundle audit: the macOS `.app` contains `Info.plist`,
+  `Contents/MacOS/metafy-desktop`, `Contents/Resources/icon.icns`, and
+  `Contents/Resources/binaries`.
 - `Info.plist` includes `CFBundleIdentifier = gg.metafy.desktop`,
-  `CFBundleShortVersionString = 0.1.0`,
-  `NSMicrophoneUsageDescription`, and `NSScreenCaptureUsageDescription`.
-- Runtime tool audit on this machine:
-  `/opt/homebrew/bin/ffmpeg` is FFmpeg 8.1.2,
-  `/opt/homebrew/bin/ffprobe` is FFprobe 8.1.2, and
+  `CFBundleShortVersionString = 0.1.0`, `NSMicrophoneUsageDescription`, and
+  `NSScreenCaptureUsageDescription`.
+- Runtime tool audit on this machine: `/opt/homebrew/bin/ffmpeg` is FFmpeg
+  8.1.2, `/opt/homebrew/bin/ffprobe` is FFprobe 8.1.2, and
   `/opt/homebrew/bin/whisper-cli --help` exits successfully.
 - Source privacy audit: HTTP client usage is confined to optional AI summaries.
   Core local defaults report `coreNetworkRequired = false` and
   `rawMediaLeavesDevice = false`.
-- Resource audit: the current `.app` does not bundle FFmpeg, FFprobe,
-  whisper.cpp, or Whisper model files. These remain local system/user resources.
+- Resource audit: no third-party FFmpeg, FFprobe, whisper.cpp, or Whisper model
+  assets have been committed. The app can now consume bundled zip archives when
+  they are added under `src-tauri/resources/binaries/<os-arch>`. Downloaded
+  archives are ignored by default and should be intentionally force-added only
+  if the release strategy changes to committed binaries.
 
 Not completed in this environment:
 
@@ -66,8 +80,8 @@ Not completed in this environment:
 
 - Which macOS, Windows, and Linux machines should be used for final packaged-app
   validation?
-- Is the MVP distribution expected to keep FFmpeg, FFprobe, and whisper.cpp as
-  system prerequisites, or should later release work bundle sidecars?
+- Which exact FFmpeg/FFprobe and whisper.cpp builds should be committed for each
+  target platform?
 
 ## Sign-Off
 

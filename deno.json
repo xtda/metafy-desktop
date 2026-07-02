@@ -10,6 +10,8 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "binaries:download": "deno run --allow-net --allow-read=. --allow-write=src-tauri/resources/binaries scripts/download-binaries.ts",
+    "binaries:download:windows": "deno task binaries:download -- --platform windows-x86_64",
     "bundle:app": "tauri build --bundles app",
     "tauri": "tauri"
   }

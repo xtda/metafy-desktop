@@ -2,9 +2,9 @@
 
 Last updated: 2026-07-02
 
-Current phase: Step 17 Resize Normalization
+Current phase: Step 18 Multi-Input Encoding & Validation
 
-Overall progress: 85%
+Overall progress: 90%
 
 Overall sign-off: Pending
 
@@ -29,7 +29,7 @@ Overall sign-off: Pending
 | 15 Source Audio Backends | Implemented | 100% | Approved | [Brief](15_source_audio_backends/15_source_audio_backends.md) | [Status](15_source_audio_backends/status.md) |
 | 16 Split Audio Session Storage | Implemented | 100% | Approved | [Brief](16_split_audio_session_storage/16_split_audio_session_storage.md) | [Status](16_split_audio_session_storage/status.md) |
 | 17 Resize Normalization | Implemented | 100% | Ready for Review | [Brief](17_resize_normalization/17_resize_normalization.md) | [Status](17_resize_normalization/status.md) |
-| 18 Multi-Input Encoding & Validation | Not Started | 0% | Pending | [Brief](18_multi_input_encoding_validation/18_multi_input_encoding_validation.md) | [Status](18_multi_input_encoding_validation/status.md) |
+| 18 Multi-Input Encoding & Validation | In Progress | 75% | Pending | [Brief](18_multi_input_encoding_validation/18_multi_input_encoding_validation.md) | [Status](18_multi_input_encoding_validation/status.md) |
 
 ## Milestone Gates
 
@@ -55,7 +55,8 @@ Overall sign-off: Pending
 ## Current Focus
 
 Step 17 resize normalization is implemented and ready for review.
-Step 18 multi-input encoding and validation remains next after Step 17 approval.
+Step 18 multi-input encoding is implemented with automated FFmpeg coverage; macOS
+and Windows manual source-capture playback validation remains pending.
 
 ## Recent Updates
 
@@ -92,6 +93,11 @@ Step 18 multi-input encoding and validation remains next after Step 17 approval.
   canvas selection, BGRA scale-to-fit normalization before `.mfrv` writes,
   centered opaque-black padding, source-dimension metadata, and automated
   recorder/library test coverage.
+- 2026-07-02: Advanced Step 18 with multi-input FFmpeg encoding support,
+  deterministic microphone + source mixing into one default AAC track,
+  missing/silent/unsupported source warnings, split staging-file cleanup,
+  synthetic encode coverage for all four audio modes, and macOS/Windows manual
+  validation checklists.
 
 ## Sign-Off Notes
 

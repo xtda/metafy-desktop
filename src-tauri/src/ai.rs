@@ -440,6 +440,13 @@ mod tests {
             }
         });
         assert!(validate_transcript_only_payload(&path_payload).is_err());
+
+        let raw_audio_payload = json!({
+            "recording": {
+                "title": "temp/recording-sessions/session-1/source_audio.pcm"
+            }
+        });
+        assert!(validate_transcript_only_payload(&raw_audio_payload).is_err());
     }
 
     #[test]
