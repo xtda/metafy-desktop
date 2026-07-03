@@ -28,7 +28,7 @@ window recording.
 | [03 App Shell & Library UI](03_app_shell_library_ui/03_app_shell_library_ui.md) | Svelte UI, navigation, library views | A usable local app shell for recording, browsing, playback, search, and settings. |
 | [04 Capture Permissions & Devices](04_capture_permissions_devices/04_capture_permissions_devices.md) | Screen/audio permissions, device selection | The app can detect capture capability, request permissions, and select screen/audio sources. |
 | [05 Recording Session Pipeline](05_recording_session_pipeline/05_recording_session_pipeline.md) | Session lifecycle, temporary files, synchronized capture | The app can start, track, stop, and persist a local recording session. |
-| [06 Encoding & Playback](06_encoding_playback/06_encoding_playback.md) | FFmpeg, MP4 output, thumbnails, local playback | Captured media becomes a playable MP4 stored in the local library. |
+| [06 Encoding & Playback](06_encoding_playback/06_encoding_playback.md) | MP4 output, thumbnails, local playback | Captured media becomes a playable MP4 stored in the local library. |
 | [07 Whisper Transcription](07_whisper_transcription/07_whisper_transcription.md) | Model management, audio extraction, transcript segments | Recordings can be transcribed locally with timestamped segments. |
 | [08 Local Search](08_local_search/08_local_search.md) | SQLite FTS5, timestamped search results | Transcript segments are locally searchable with jump-to-timestamp playback. |
 | [09 Optional AI Summaries](09_optional_ai_summaries/09_optional_ai_summaries.md) | Transcript-only AI analysis | Optional summaries, action items, decisions, questions, and chapters are generated and stored locally. |
@@ -40,7 +40,7 @@ window recording.
 | [15 Source Audio Backends](15_source_audio_backends/15_source_audio_backends.md) | ScreenCaptureKit, Windows application loopback, source audio capability | Selected source audio can be captured separately from microphone audio. |
 | [16 Split Audio Session Storage](16_split_audio_session_storage/16_split_audio_session_storage.md) | SQLite schema, temp files, recording session metadata | Microphone audio and source audio are stored as separate recoverable sidecars. |
 | [17 Resize Normalization](17_resize_normalization/17_resize_normalization.md) | Frame normalization, stable BGRA stream | Window resizes no longer break rawvideo encoding. |
-| [18 Multi-Input Encoding & Validation](18_multi_input_encoding_validation/18_multi_input_encoding_validation.md) | FFmpeg multi-audio input, mixed playback, macOS/Windows validation | Recordings encode and play correctly across all audio modes and required platforms. |
+| [18 Multi-Input Encoding & Validation](18_multi_input_encoding_validation/18_multi_input_encoding_validation.md) | Multi-audio input, mixed playback, macOS/Windows validation | Recordings encode and play correctly across all audio modes and required platforms. |
 
 ## Sign-Off Flow
 

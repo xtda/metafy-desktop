@@ -7,7 +7,7 @@ Handle application/window resize during recording by normalizing captured frames
 ## PRD Coverage
 
 - Reliable application/window recording
-- Stable FFmpeg rawvideo input
+- Stable encoder video input
 - Recoverable capture pipeline
 - Local video processing
 

@@ -10,10 +10,10 @@ Last updated: 2026-07-02
 
 ## Checklist
 
-- [x] FFmpeg supports video-only recordings.
-- [x] FFmpeg supports microphone-only recordings.
-- [x] FFmpeg supports source-only recordings.
-- [x] FFmpeg supports microphone + source recordings.
+- [x] Encoder supports video-only recordings.
+- [x] Encoder supports microphone-only recordings.
+- [x] Encoder supports source-only recordings.
+- [x] Encoder supports microphone + source recordings.
 - [x] Missing, silent, or unsupported requested audio sources produce warnings.
 - [ ] Encoded MP4 playback works for all audio modes.
 - [x] macOS manual validation checklist is complete.
@@ -26,10 +26,9 @@ Last updated: 2026-07-02
 - 2026-07-02: Reworked `src-tauri/src/encoding.rs` so encoding derives an
   ordered list of requested audio sidecars from the persisted recording session
   audio mode. Video-only, microphone-only, source-only, and microphone + source
-  recordings now share the same FFmpeg command builder.
-- 2026-07-02: Added deterministic FFmpeg mixing for microphone + source audio.
-  Each source is staged independently, normalized to 48 kHz stereo float inside
-  FFmpeg, mixed with `amix=duration=longest:dropout_transition=0:normalize=0`,
+  recordings now share the same final encode preparation path.
+- 2026-07-02: Added deterministic shared Rust mixing for microphone + source
+  audio. Each source is normalized to 48 kHz stereo float before final encode
   and written as one default AAC audio track for MVP playback.
 - 2026-07-02: Missing requested sidecars, empty requested sidecars, missing
   sample metadata, and unsupported sample formats now produce warnings and omit
@@ -41,10 +40,9 @@ Last updated: 2026-07-02
   covering macOS and Windows video-only, microphone-only, source-only,
   microphone + source, process-loopback limitations, resize, playback, artifact,
   and optional AI guardrail checks.
-- 2026-07-02: `cargo test encoding --lib` passed: 6 passed, 0 failed. Coverage
-  includes real synthetic FFmpeg encode runs for video-only, microphone-only,
-  source-only, and microphone + source recordings, command-shape tests for the
-  mixed filter, and missing/silent/unsupported audio warning behavior.
+- 2026-07-02: Historical: `cargo test encoding --lib` passed for the original
+  command-encoder implementation. Current native/GStreamer validation is
+  tracked in `docs/native_encode/`.
 - 2026-07-02: `cargo test --lib` passed: 41 passed, 0 failed. Existing warnings
   are from the vendored `scap` crate. Optional AI guardrail coverage includes
   direct rejection of split raw-audio `.pcm` sidecar paths.

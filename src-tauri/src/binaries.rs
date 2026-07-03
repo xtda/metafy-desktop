@@ -14,8 +14,7 @@ const BUNDLED_RESOURCE_DIRECTORY: &str = "binaries";
 const BUNDLED_TOOLS_DIRECTORY: &str = "tools";
 const BUNDLED_TOOLS_VERSION: &str = "v1";
 const INSTALL_MANIFEST_FILE: &str = ".metafy-bundled-tools";
-const KNOWN_BUNDLED_BINARY_NAMES: &[&str] =
-    &["ffmpeg", "ffprobe", "whisper-cli", "main", "whisper"];
+const KNOWN_BUNDLED_BINARY_NAMES: &[&str] = &["whisper-cli", "main", "whisper"];
 
 static BUNDLED_TOOLS_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
@@ -481,15 +480,15 @@ mod tests {
         let archive_path = root.join("tools.zip");
         let destination = root.join("out");
 
-        create_test_zip(&archive_path, "bin/ffmpeg", b"fake ffmpeg", 0o644);
+        create_test_zip(&archive_path, "bin/whisper-cli", b"fake whisper", 0o644);
 
         extract_zip_archive(&archive_path, &destination).expect("extract archive");
         ensure_known_binaries_are_executable(&destination).expect("set executable bits");
 
-        let extracted = destination.join("bin").join("ffmpeg");
+        let extracted = destination.join("bin").join("whisper-cli");
         assert_eq!(
             fs::read_to_string(&extracted).expect("read extracted binary"),
-            "fake ffmpeg"
+            "fake whisper"
         );
 
         #[cfg(unix)]
@@ -513,12 +512,12 @@ mod tests {
         let archive_path = root.join("tools.zip");
         let destination = root.join("out");
 
-        create_test_zip(&archive_path, "../ffmpeg", b"fake ffmpeg", 0o755);
+        create_test_zip(&archive_path, "../escaped-tool", b"fake tool", 0o755);
 
         let error = extract_zip_archive(&archive_path, &destination)
             .expect_err("unsafe archive should fail");
         assert!(error.contains("unsafe path"));
-        assert!(!root.join("ffmpeg").exists());
+        assert!(!root.join("escaped-tool").exists());
 
         let _ = fs::remove_dir_all(root);
     }

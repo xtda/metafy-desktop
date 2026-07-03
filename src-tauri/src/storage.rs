@@ -1094,7 +1094,11 @@ impl StorageState {
 
         let temp_directory_relative =
             format!("{TEMP_DIRECTORY_NAME}/{RECORDING_SESSIONS_DIRECTORY_NAME}/{session_id}");
-        let video_path_relative = format!("{temp_directory_relative}/screen_frames.mfrv");
+        let video_path_relative = if cfg!(target_os = "macos") {
+            crate::media::chunked_video::chunked_manifest_relative_path(&temp_directory_relative)
+        } else {
+            format!("{temp_directory_relative}/screen_frames.mfrv")
+        };
         let microphone_audio_path_relative = audio_mode
             .includes_microphone()
             .then(|| format!("{temp_directory_relative}/microphone.pcm"));
@@ -1103,6 +1107,10 @@ impl StorageState {
             .then(|| format!("{temp_directory_relative}/source_audio.pcm"));
         let audio_path_relative = microphone_audio_path_relative.clone();
         let metadata_path_relative = format!("{temp_directory_relative}/session.json");
+
+        if let Some(parent) = self.paths.root.join(&video_path_relative).parent() {
+            fs::create_dir_all(parent)?;
+        }
 
         Ok(RecordingSessionFiles {
             video_path: self.paths.root.join(&video_path_relative),

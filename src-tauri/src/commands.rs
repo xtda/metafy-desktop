@@ -8,6 +8,7 @@ use crate::jobs::{
     CleanupProcessingFilesInput, CleanupTempFilesResult, JobRecoverySummary,
     RetryProcessingJobInput,
 };
+use crate::media::readiness::{selected_media_backend_readiness, MediaBackendReadiness};
 use crate::recorder::RecordingRuntime;
 use crate::storage::{
     AiSettings, AiSummary, CaptureSelection, CreateProcessingJobInput, CreateRecordingInput,
@@ -26,6 +27,7 @@ pub struct AppBootstrap {
     pub runtime: RuntimeInfo,
     pub local_only: LocalOnlyDefaults,
     pub storage: StorageOverview,
+    pub media_backend: MediaBackendReadiness,
     pub native_boundaries: Vec<NativeBoundary>,
     pub available_commands: Vec<&'static str>,
 }
@@ -44,7 +46,7 @@ pub struct RuntimeInfo {
 pub struct NativeBoundary {
     pub domain: &'static str,
     pub owner: &'static str,
-    pub status: &'static str,
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +77,8 @@ pub struct RecordingSessionEnvelope {
 
 #[tauri::command]
 pub fn app_bootstrap(storage: State<'_, StorageState>) -> Result<AppBootstrap, String> {
+    let media_backend = selected_media_backend_readiness();
+
     Ok(AppBootstrap {
         app_name: "Metafy Desktop",
         runtime: RuntimeInfo {
@@ -85,36 +89,37 @@ pub fn app_bootstrap(storage: State<'_, StorageState>) -> Result<AppBootstrap, S
         },
         local_only: local_only_defaults(),
         storage: storage.overview().map_err(command_error)?,
+        media_backend: media_backend.clone(),
         native_boundaries: vec![
             NativeBoundary {
                 domain: "filesystem",
                 owner: "Rust",
-                status: "implemented",
+                status: "implemented".to_owned(),
             },
             NativeBoundary {
                 domain: "capture",
                 owner: "Rust",
-                status: "recording-session-implemented",
+                status: "recording-session-implemented".to_owned(),
             },
             NativeBoundary {
                 domain: "encoding",
                 owner: "Rust",
-                status: "implemented-system-ffmpeg",
+                status: media_backend.status.clone(),
             },
             NativeBoundary {
                 domain: "transcription",
                 owner: "Rust",
-                status: "implemented-local-whisper",
+                status: "implemented-local-whisper".to_owned(),
             },
             NativeBoundary {
                 domain: "jobs",
                 owner: "Rust",
-                status: "implemented",
+                status: "implemented".to_owned(),
             },
             NativeBoundary {
                 domain: "optional_ai",
                 owner: "Rust",
-                status: "implemented-transcript-only",
+                status: "implemented-transcript-only".to_owned(),
             },
         ],
         available_commands: vec![

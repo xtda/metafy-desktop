@@ -12,7 +12,7 @@ Last updated: 2026-07-02
 
 - [x] Release build configuration exists.
 - [x] Platform packaging notes exist.
-- [x] FFmpeg/Whisper resource strategy is audited.
+- [x] Whisper resource strategy is audited.
 - [ ] Offline core workflow validation is complete.
 - [ ] 1080p 30 FPS recording validation is complete.
 - [ ] Failure recovery validation is complete.
@@ -23,22 +23,22 @@ Last updated: 2026-07-02
 - Added `deno task bundle:app` / `npm run bundle:app` as the macOS release app
   bundle entrypoint.
 - Added `build_steps/11_packaging_validation/packaging_notes.md` with macOS,
-  Windows, Linux, FFmpeg, Whisper, offline, and privacy packaging notes.
+  Windows, Linux, native/GStreamer encoding, Whisper, offline, and privacy
+  packaging notes.
 - Added `build_steps/11_packaging_validation/manual_validation_checklist.md` for
   packaged-app MVP sign-off.
-- Added shared runtime binary discovery in `src-tauri/src/binaries.rs`. FFmpeg,
-  FFprobe, and whisper.cpp now resolve via explicit env var, extracted bundled
-  tools, `PATH`, then common system install locations. This covers
-  Finder-launched macOS apps that do not inherit the Homebrew PATH.
+- Added shared runtime binary discovery in `src-tauri/src/binaries.rs`.
+  Historical Step 11 evidence covered command encoder tools; current product
+  code uses this path for whisper.cpp discovery only.
 - Added optional bundled binary archive support. Tauri now includes
   `src-tauri/resources/binaries`, and app startup extracts current-platform
   `.zip` archives into `app-data/tools/v1/<os-arch>` before runtime lookup.
 - Added `deno task binaries:download` and `deno task binaries:download:windows`
-  to populate local Windows x64 FFmpeg and whisper.cpp archives for package
-  testing without committing third-party binaries.
-- `deno task binaries:download -- --platform windows-x86_64 --dry-run` passed.
-  It selected `ffmpeg-n8.1-latest-win64-gpl-8.1.zip` from BtbN and
-  `whisper-bin-x64.zip` from whisper.cpp.
+  to populate local Windows x64 whisper.cpp archives for package testing
+  without committing third-party binaries.
+- Historical: `deno task binaries:download -- --platform windows-x86_64 --dry-run`
+  previously selected a command encoder archive and `whisper-bin-x64.zip`.
+  The current download task resolves only `whisper-bin-x64.zip`.
 - `cargo check` passed after adding the bundled archive extractor and `zip`
   dependency.
 - `cargo test` passed: 43 tests passed, 0 failed.
@@ -55,17 +55,16 @@ Last updated: 2026-07-02
 - `Info.plist` includes `CFBundleIdentifier = gg.metafy.desktop`,
   `CFBundleShortVersionString = 0.1.0`, `NSMicrophoneUsageDescription`, and
   `NSScreenCaptureUsageDescription`.
-- Runtime tool audit on this machine: `/opt/homebrew/bin/ffmpeg` is FFmpeg
-  8.1.2, `/opt/homebrew/bin/ffprobe` is FFprobe 8.1.2, and
-  `/opt/homebrew/bin/whisper-cli --help` exits successfully.
+- Runtime tool audit on this machine: `/opt/homebrew/bin/whisper-cli --help`
+  exits successfully.
 - Source privacy audit: HTTP client usage is confined to optional AI summaries.
   Core local defaults report `coreNetworkRequired = false` and
   `rawMediaLeavesDevice = false`.
-- Resource audit: no third-party FFmpeg, FFprobe, whisper.cpp, or Whisper model
-  assets have been committed. The app can now consume bundled zip archives when
-  they are added under `src-tauri/resources/binaries/<os-arch>`. Downloaded
-  archives are ignored by default and should be intentionally force-added only
-  if the release strategy changes to committed binaries.
+- Resource audit: no third-party whisper.cpp or Whisper model assets have been
+  committed. The app can consume bundled Whisper zip archives when they are
+  added under `src-tauri/resources/binaries/<os-arch>`. Downloaded archives are
+  ignored by default and should be intentionally force-added only if the release
+  strategy changes to committed binaries.
 
 Not completed in this environment:
 
@@ -80,8 +79,7 @@ Not completed in this environment:
 
 - Which macOS, Windows, and Linux machines should be used for final packaged-app
   validation?
-- Which exact FFmpeg/FFprobe and whisper.cpp builds should be committed for each
-  target platform?
+- Which exact whisper.cpp builds should be committed for each target platform?
 
 ## Sign-Off
 

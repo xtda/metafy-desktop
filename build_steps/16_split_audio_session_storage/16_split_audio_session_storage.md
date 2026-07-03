@@ -46,6 +46,6 @@ Update recording sessions, temporary files, and metadata so microphone audio and
 ## Out Of Scope
 
 - Native source-audio backend internals.
-- FFmpeg mixing.
+- Final encoder mixing internals.
 - Transcript model changes beyond consuming final MP4 output.
 - Post-recording track editing.

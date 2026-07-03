@@ -29,12 +29,6 @@ const supportedPlatforms = new Set(["windows-x86_64"]);
 const specsByPlatform: Record<string, DownloadSpec[]> = {
   "windows-x86_64": [
     {
-      source: "FFmpeg",
-      repo: "BtbN/FFmpeg-Builds",
-      destinationName: "ffmpeg.zip",
-      selectAsset: selectWindowsFfmpegAsset,
-    },
-    {
       source: "whisper.cpp",
       repo: "ggml-org/whisper.cpp",
       destinationName: "whisper.zip",
@@ -131,7 +125,7 @@ function parseArgs(args: string[]): CliOptions {
 function printHelpAndExit(): never {
   console.log(
     [
-      "Download bundled FFmpeg/Whisper archives for local package testing.",
+      "Download bundled Whisper archives for local package testing.",
       "",
       "Usage:",
       "  deno task binaries:download",
@@ -167,47 +161,6 @@ async function fetchLatestRelease(repo: string): Promise<GitHubRelease> {
     );
   }
   return await response.json() as GitHubRelease;
-}
-
-function selectWindowsFfmpegAsset(release: GitHubRelease): GitHubAsset {
-  const stableAssets = release.assets
-    .map((asset) => ({
-      asset,
-      version: windowsFfmpegStableVersion(asset.name),
-    }))
-    .filter((entry): entry is { asset: GitHubAsset; version: number[] } =>
-      entry.version !== null
-    )
-    .sort((left, right) => compareVersions(right.version, left.version));
-
-  if (stableAssets.length > 0) {
-    return stableAssets[0].asset;
-  }
-
-  const masterAsset = release.assets.find((asset) =>
-    asset.name === "ffmpeg-master-latest-win64-gpl.zip"
-  );
-  if (!masterAsset) {
-    throw new Error(
-      "Unable to find a Windows x64 GPL FFmpeg zip in the latest BtbN release.",
-    );
-  }
-  return masterAsset;
-}
-
-function windowsFfmpegStableVersion(name: string): number[] | null {
-  const match = name.match(/^ffmpeg-n([0-9.]+)-latest-win64-gpl-[0-9.]+\.zip$/);
-  if (!match) return null;
-  return match[1].split(".").map((part) => Number(part));
-}
-
-function compareVersions(left: number[], right: number[]): number {
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const difference = (left[index] ?? 0) - (right[index] ?? 0);
-    if (difference !== 0) return difference;
-  }
-  return 0;
 }
 
 async function downloadAsset(asset: GitHubAsset, destination: URL) {

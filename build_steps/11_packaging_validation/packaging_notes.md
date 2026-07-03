@@ -27,8 +27,8 @@ platform-specific release work.
   `src-tauri/resources/binaries` when present.
 - `Info.plist` includes microphone and screen capture usage descriptions:
   `NSMicrophoneUsageDescription` and `NSScreenCaptureUsageDescription`.
-- Runtime tools can come from explicit env vars, bundled zip archives extracted
-  into app data, `PATH`, or common Homebrew/MacPorts locations.
+- Whisper tools can come from the explicit env var, bundled zip archives
+  extracted into app data, `PATH`, or common Homebrew/MacPorts locations.
 - First manual launch should verify macOS screen recording and microphone
   permissions from the packaged app, not only from `tauri dev`.
 
@@ -36,10 +36,10 @@ platform-specific release work.
 
 - Build on a Windows host with the same Tauri config and run
   `deno task tauri build` or a Windows-specific Tauri bundle target.
-- FFmpeg, FFprobe, and whisper.cpp can be bundled by adding zip archives under
-  `src-tauri/resources/binaries/windows-x86_64`. Without archives, install them
-  on `PATH` or set `METAFY_FFMPEG_PATH`, `METAFY_FFPROBE_PATH`, and
-  `METAFY_WHISPER_CPP_PATH`.
+- Media encoding uses Media Foundation on Windows. whisper.cpp can be bundled
+  by adding `whisper.zip` under
+  `src-tauri/resources/binaries/windows-x86_64`. Without an archive, install a
+  supported whisper.cpp command on `PATH` or set `METAFY_WHISPER_CPP_PATH`.
 - Validate Windows display capture permissions, microphone enumeration, MP4
   playback, and local app data path behavior on the target host.
 - Installer packaging, signing, and auto-update are out of scope for the MVP
@@ -49,16 +49,17 @@ platform-specific release work.
 
 - Build on the target Linux distribution with the same Tauri config and run
   `deno task tauri build` or a Linux-specific Tauri bundle target.
-- FFmpeg, FFprobe, and whisper.cpp can be bundled by adding zip archives under
-  the matching `src-tauri/resources/binaries/linux-*` directory. Without
-  archives, install them on `PATH`, in a common system location, or set the
-  explicit env vars.
+- Media encoding uses GStreamer on Linux, so target hosts need GStreamer and
+  H.264/AAC plugins installed. whisper.cpp can be bundled by adding
+  `whisper.zip` under the matching `src-tauri/resources/binaries/linux-*`
+  directory. Without an archive, install a supported whisper.cpp command on
+  `PATH`, in a common system location, or set `METAFY_WHISPER_CPP_PATH`.
 - Validate capture support under the target display server. Wayland/X11 support
   can vary by distribution, compositor, and portal setup.
 - Installer packaging, repository publication, and auto-update are out of scope
   for the MVP validation step.
 
-## FFmpeg And Whisper Resource Audit
+## Whisper Resource Audit
 
 - Tauri bundles optional zip archives from `src-tauri/resources/binaries`.
   Archives are expected under an `os-arch` directory such as `macos-aarch64`,
@@ -70,17 +71,13 @@ platform-specific release work.
   accidentally stage third-party binary blobs.
 - On startup, the app extracts current-platform `.zip` archives into
   `app-data/tools/v1/<os-arch>` when archive metadata changes.
-- FFmpeg lookup order: `METAFY_FFMPEG_PATH`, then extracted bundled tools, then
-  `PATH`, then common system install locations.
-- FFprobe lookup order: `METAFY_FFPROBE_PATH`, then extracted bundled tools,
-  then `PATH`, then common system install locations.
 - Whisper lookup order: `METAFY_WHISPER_CPP_PATH`, then extracted bundled tools,
   then `PATH`, then common system install locations.
 - Whisper candidate binary names: `whisper-cli`, `main`, `whisper`.
 - Whisper models are local user resources under `app-data/models/whisper`.
 - Default model name remains `small.en`, with expected file `ggml-small.en.bin`.
 - The current download task supports `windows-x86_64` only. macOS still uses
-  system/Homebrew-style runtime discovery unless macOS archives are added
+  system/Homebrew-style Whisper discovery unless macOS archives are added
   manually.
 
 ## Offline And Privacy Notes

@@ -4,7 +4,7 @@
 
 Allow the user to select a specific display, application, or window as the capture source on macOS and Windows, record source audio separately from microphone audio, and produce a reliable final recording even when the captured window is resized.
 
-The MVP should keep the current raw capture -> local temp files -> FFmpeg encode flow where practical. The important change is that the capture model becomes source-oriented instead of display-oriented, and audio becomes multi-source instead of microphone-only.
+The MVP keeps the raw capture -> local temp files -> final encode flow. The important change is that the capture model becomes source-oriented instead of display-oriented, and audio becomes multi-source instead of microphone-only.
 
 ## Current State
 
@@ -34,7 +34,7 @@ The MVP should keep the current raw capture -> local temp files -> FFmpeg encode
 - Linux window audio support.
 - User-adjustable post-recording audio mixing controls.
 - Editing separate audio tracks after recording.
-- Switching to direct-to-file encoders or replacing FFmpeg.
+- Switching to direct-to-file encoders.
 
 ## Build Step Breakdown
 
@@ -48,7 +48,7 @@ The expanded MVP is tracked as Steps 12-18 under `build_steps/`.
 | [15 Source Audio Backends](../build_steps/15_source_audio_backends/15_source_audio_backends.md) | ScreenCaptureKit and Windows application loopback | Source audio is captured separately from microphone audio. |
 | [16 Split Audio Session Storage](../build_steps/16_split_audio_session_storage/16_split_audio_session_storage.md) | SQLite, temp files, session sidecars | Microphone and source audio are recoverable independent artifacts. |
 | [17 Resize Normalization](../build_steps/17_resize_normalization/17_resize_normalization.md) | Stable BGRA output canvas | Window resizing does not break encoding. |
-| [18 Multi-Input Encoding & Validation](../build_steps/18_multi_input_encoding_validation/18_multi_input_encoding_validation.md) | FFmpeg mix/mux and platform validation | All audio modes encode and play correctly on macOS and Windows. |
+| [18 Multi-Input Encoding & Validation](../build_steps/18_multi_input_encoding_validation/18_multi_input_encoding_validation.md) | Mixed-audio encoding and platform validation | All audio modes encode and play correctly on macOS and Windows. |
 
 ## Capture Source Model
 
@@ -180,7 +180,7 @@ Required policy:
 5. Fill unused pixels with black.
 6. Continue writing a dimension-stable BGRA stream.
 
-This keeps the raw video file compatible with the existing FFmpeg rawvideo path and avoids encode-time failures after an otherwise successful recording.
+This keeps the raw video file compatible with the final encoder input path and avoids encode-time failures after an otherwise successful recording.
 
 Open implementation detail:
 
@@ -198,7 +198,7 @@ This preserves:
 
 - Current microphone permission flow.
 - Current audio timing headers.
-- Current FFmpeg raw PCM input path for the microphone sidecar.
+- Current raw PCM input path for the microphone sidecar.
 - Current transcription path after MP4 encoding.
 
 Required changes:
@@ -271,23 +271,23 @@ Linux support likely needs a PipeWire portal based approach for screen/window ca
 
 ## Encoding Requirements
 
-Keep FFmpeg as the final muxing and encoding boundary.
+Use the selected native/GStreamer backend as the final muxing and encoding boundary.
 
 Video:
 
 - The raw BGRA video stream must have stable dimensions.
-- Resize normalization should happen before FFmpeg sees the rawvideo input.
-- FFmpeg should continue receiving one rawvideo input.
+- Resize normalization should happen before final encode sees the video input.
+- The final encoder should continue receiving one video input.
 
 Audio:
 
 - Support zero, one, or two raw audio inputs.
-- Microphone audio and source audio should be separate FFmpeg inputs.
-- Mix microphone and source audio during FFmpeg encode when the final MP4 should have one playback track.
+- Microphone audio and source audio should remain separate sidecars until shared audio preparation.
+- Mix microphone and source audio during final encode preparation when the final MP4 should have one playback track.
 - Optionally preserve separate MP4 audio tracks later, but do not require that for the MVP.
 - Preserve warning paths if a requested source is missing, unsupported, or silent.
 
-Example FFmpeg direction for two audio inputs:
+Example direction for two audio inputs:
 
 ```text
 video raw BGRA -> 0:v
@@ -296,7 +296,7 @@ source PCM -> 2:a
 amix=inputs=2 -> encoded AAC
 ```
 
-Do not mix raw audio in Rust unless FFmpeg cannot express the desired behavior.
+Keep audio mixing deterministic and covered by shared Rust tests.
 
 The transcript extraction path can continue extracting from the final MP4. If separate MP4 tracks are preserved later, transcription should use the mixed speech-relevant track or an explicit transcription mixdown.
 
@@ -403,7 +403,7 @@ Automated checks:
 - Encoder behavior with source-only audio.
 - Encoder behavior with microphone + source audio.
 - Resize normalization for smaller, larger, wider, and taller frames.
-- FFmpeg command construction for zero, one, and two audio inputs.
+- Encoder behavior for zero, one, and two audio inputs.
 
 Manual checks:
 

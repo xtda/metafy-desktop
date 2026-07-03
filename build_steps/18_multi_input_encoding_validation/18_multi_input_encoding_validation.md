@@ -6,7 +6,7 @@ Encode recordings that may contain zero, one, or two audio sources, then validat
 
 ## PRD Coverage
 
-- FFmpeg MP4 encoding
+- MP4 encoding
 - Microphone and source-audio mixing
 - Local playback
 - Cross-platform validation
@@ -14,7 +14,7 @@ Encode recordings that may contain zero, one, or two audio sources, then validat
 
 ## Deliverables
 
-- FFmpeg command builder support for:
+- Final encoder support for:
   - video-only recordings
   - microphone-only recordings
   - source-only recordings
@@ -28,7 +28,7 @@ Encode recordings that may contain zero, one, or two audio sources, then validat
 
 ## Implementation Notes
 
-- Use FFmpeg for audio mixing instead of mixing PCM in Rust.
+- Use shared Rust audio preparation to normalize and mix PCM before final encode.
 - Preserve source sidecars until final encode succeeds.
 - Keep transcription pointed at the final MP4 or an explicit transcription mixdown.
 - If separate MP4 audio tracks are added later, keep the MVP playback path simple with a default mixed track.

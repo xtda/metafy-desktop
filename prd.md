@@ -108,7 +108,9 @@ Microphone
 
 Encoding
 
-- FFmpeg
+- AVFoundation on macOS
+- Media Foundation on Windows
+- GStreamer on Linux
 
 Speech Recognition
 
@@ -204,7 +206,7 @@ cpal
 
       ▼
 
-ffmpeg
+native/GStreamer media backend
 
       ▼
 

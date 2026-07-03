@@ -1,16 +1,16 @@
 # Bundled Binary Archives
 
-Place optional per-platform FFmpeg, FFprobe, and whisper.cpp archives here.
+Place optional per-platform whisper.cpp archives here.
 
 The archives are not committed by default. The downloaded `.zip` files are
 ignored so local testing does not accidentally stage third-party binary blobs.
-For a Windows x64 checkout, populate the local archives with:
+For a Windows x64 checkout, populate the local archive with:
 
 ```sh
 deno task binaries:download
 ```
 
-From another platform, prepare Windows archives with:
+From another platform, prepare the Windows archive with:
 
 ```sh
 deno task binaries:download:windows
@@ -21,16 +21,12 @@ Expected layout:
 ```text
 src-tauri/resources/binaries/
   macos-aarch64/
-    ffmpeg.zip
     whisper.zip
   macos-x86_64/
-    ffmpeg.zip
     whisper.zip
   windows-x86_64/
-    ffmpeg.zip
     whisper.zip
   linux-x86_64/
-    ffmpeg.zip
     whisper.zip
 ```
 
@@ -42,8 +38,6 @@ system `PATH` and common install locations.
 
 Recognized executable names:
 
-- `ffmpeg`
-- `ffprobe`
 - `whisper-cli`
 - `main`
 - `whisper`

@@ -19,7 +19,7 @@ Package and validate the local-only MVP across supported desktop targets, with e
 - Development validation checklist.
 - Release build configuration.
 - Platform packaging notes for macOS, Windows, and Linux.
-- Bundled resource/sidecar audit for FFmpeg and Whisper strategy.
+- Bundled resource/sidecar audit for native/GStreamer encoding and Whisper strategy.
 - Basic performance validation for 1080p 30 FPS recording.
 - Offline-mode validation.
 - Privacy validation that confirms audio/video are not uploaded by core workflows.

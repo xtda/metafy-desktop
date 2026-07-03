@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::binaries::{find_binary, missing_binary_message};
+use crate::media::audio::{
+    mix_audio_sources, prepare_audio_source, prepare_transcription_samples,
+    TRANSCRIPTION_SAMPLE_RATE,
+};
+use crate::media::sidecar::{RawAudioFormat, RawAudioMetadataError, RawAudioReader};
+use crate::media::sidecar_selection::{
+    select_requested_audio_sidecars, AudioSidecarInput, AudioSidecarPurpose,
+};
+use crate::media::wav::write_mono_i16_wav;
 use crate::storage::{
     PersistTranscriptInput, Recording, RecordingStatus, StorageState, TranscriptSegmentInput,
     TranscriptStatus, TranscriptWithSegments,
@@ -12,12 +21,9 @@ use crate::storage::{
 
 pub const DEFAULT_WHISPER_MODEL: &str = "small.en";
 const WHISPER_MODEL_ENV_VAR: &str = "METAFY_WHISPER_CPP_PATH";
-const FFMPEG_ENV_VAR: &str = "METAFY_FFMPEG_PATH";
 const TRANSCRIPT_JSON_FILE_NAME: &str = "transcript.json";
 const TRANSCRIPT_AUDIO_FILE_NAME: &str = "transcript-audio.wav";
 const WHISPER_OUTPUT_PREFIX: &str = "whisper-output";
-const AUDIO_SAMPLE_RATE: i64 = 16_000;
-const AUDIO_CHANNELS: i64 = 1;
 const DEFAULT_CHUNK_DURATION_MS: i64 = 30_000;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,10 +74,9 @@ pub struct WhisperBinaryStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AudioExtractionResult {
     pub recording_id: String,
-    pub media_path: String,
+    pub media_path: Option<String>,
     pub audio_path: String,
-    pub ffmpeg_path: String,
-    pub ffmpeg_args: Vec<String>,
+    pub warnings: Vec<String>,
     pub chunk_duration_ms: i64,
 }
 
@@ -81,14 +86,13 @@ pub struct TranscriptionResult {
     pub recording_id: String,
     pub model_name: String,
     pub model_path: String,
-    pub media_path: String,
+    pub media_path: Option<String>,
     pub audio_path: String,
     pub raw_json_path: String,
     pub raw_json_path_relative: String,
     pub whisper_path: String,
     pub whisper_args: Vec<String>,
-    pub ffmpeg_path: String,
-    pub ffmpeg_args: Vec<String>,
+    pub warnings: Vec<String>,
     pub chunk_duration_ms: i64,
     pub segment_count: usize,
     pub language: Option<String>,
@@ -96,7 +100,7 @@ pub struct TranscriptionResult {
 }
 
 struct RecordingTranscriptPaths {
-    media_path: PathBuf,
+    media_path: Option<PathBuf>,
     recording_directory: PathBuf,
     audio_path: PathBuf,
     raw_json_path: PathBuf,
@@ -222,23 +226,29 @@ pub fn extract_recording_audio(
     recording_id: &str,
 ) -> Result<AudioExtractionResult, String> {
     let (recording, paths) = recording_transcript_paths(storage, recording_id)?;
-    let ffmpeg_path = find_binary(FFMPEG_ENV_VAR, &["ffmpeg"])
-        .ok_or_else(|| missing_binary_message("ffmpeg", FFMPEG_ENV_VAR))?;
+    let session = storage
+        .get_recording_session_by_recording(&recording.id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Recording session metadata is required before transcription.".to_owned())?;
 
     remove_file_if_exists(&paths.audio_path)?;
     fs::create_dir_all(&paths.recording_directory)
         .map_err(|error| format!("Unable to prepare transcript directory: {error}"))?;
 
-    let extract_command =
-        build_audio_extract_command(&ffmpeg_path, &paths.media_path, &paths.audio_path);
-    run_logged_command(&extract_command, "FFmpeg audio extraction")?;
+    let mut warnings = Vec::new();
+    let inputs = select_requested_audio_sidecars(
+        storage,
+        &session,
+        AudioSidecarPurpose::Transcription,
+        &mut warnings,
+    );
+    prepare_transcription_audio(inputs, &paths.audio_path, &mut warnings)?;
 
     Ok(AudioExtractionResult {
         recording_id: recording.id,
-        media_path: path_to_string(&paths.media_path),
+        media_path: paths.media_path.as_ref().map(|path| path_to_string(path)),
         audio_path: path_to_string(&paths.audio_path),
-        ffmpeg_path: path_to_string(&ffmpeg_path),
-        ffmpeg_args: extract_command.args,
+        warnings,
         chunk_duration_ms: DEFAULT_CHUNK_DURATION_MS,
     })
 }
@@ -304,15 +314,14 @@ pub fn run_whisper_recording(
         recording_id: recording.id,
         model_name: selected_model,
         model_path: path_to_string(&model_path),
-        media_path: path_to_string(&paths.media_path),
+        media_path: paths.media_path.as_ref().map(|path| path_to_string(path)),
         audio_path: path_to_string(&paths.audio_path),
         raw_json_path: path_to_string(&paths.raw_json_path),
         raw_json_path_relative: paths.raw_json_path_relative,
         whisper_path: path_to_string(&whisper_path),
         whisper_args: whisper_command.args,
-        ffmpeg_path: extraction.ffmpeg_path,
-        ffmpeg_args: extraction.ffmpeg_args,
-        chunk_duration_ms: DEFAULT_CHUNK_DURATION_MS,
+        warnings: extraction.warnings,
+        chunk_duration_ms: extraction.chunk_duration_ms,
         segment_count: transcript.segments.len(),
         language: transcript.transcript.language.clone(),
         transcript,
@@ -335,15 +344,7 @@ fn recording_transcript_paths(
     let media_path = recording
         .media_path
         .as_deref()
-        .map(|path| storage.resolve_path(path))
-        .ok_or_else(|| "Recording has no MP4 media path to transcribe.".to_owned())?;
-
-    if !media_path.is_file() {
-        return Err(format!(
-            "Recording media file is missing: {}",
-            path_to_string(&media_path)
-        ));
-    }
+        .map(|path| storage.resolve_path(path));
 
     let recording_directory = storage.resolve_path(&recording.recording_directory);
     let recording_directory_relative = recording.recording_directory.trim_end_matches('/');
@@ -419,27 +420,99 @@ fn model_file_name(file_name: &str) -> String {
     file_name.to_owned()
 }
 
-fn build_audio_extract_command(
-    ffmpeg_path: &Path,
-    media_path: &Path,
+fn prepare_transcription_audio(
+    inputs: Vec<AudioSidecarInput>,
     audio_path: &Path,
-) -> CommandOutput {
-    CommandOutput {
-        program: ffmpeg_path.to_path_buf(),
-        args: vec![
-            "-hide_banner".to_owned(),
-            "-y".to_owned(),
-            "-i".to_owned(),
-            path_to_string(media_path),
-            "-vn".to_owned(),
-            "-ac".to_owned(),
-            AUDIO_CHANNELS.to_string(),
-            "-ar".to_owned(),
-            AUDIO_SAMPLE_RATE.to_string(),
-            "-f".to_owned(),
-            "wav".to_owned(),
-            path_to_string(audio_path),
-        ],
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut sources = Vec::new();
+
+    for input in inputs {
+        if !input.path.exists() {
+            warnings.push(format!(
+                "{} was requested but the capture file was missing; transcription audio prepared without this source.",
+                input.label
+            ));
+            continue;
+        }
+
+        let format = match RawAudioFormat::from_session_metadata(
+            input.sample_rate,
+            input.channels,
+            input.sample_format,
+        ) {
+            Ok(format) => format,
+            Err(error) => {
+                warnings.push(transcription_audio_metadata_warning(input.label, error));
+                continue;
+            }
+        };
+        let mut reader = match RawAudioReader::open(&input.path, format) {
+            Ok(reader) => reader,
+            Err(error) => {
+                warnings.push(format!(
+                    "Unable to read captured {}: {error}; transcription audio prepared without this source.",
+                    input.label
+                ));
+                continue;
+            }
+        };
+        let source = match prepare_audio_source(&mut reader) {
+            Ok(source) => source,
+            Err(error) => {
+                warnings.push(format!(
+                    "Unable to prepare captured {}: {error}; transcription audio prepared without this source.",
+                    input.label
+                ));
+                continue;
+            }
+        };
+
+        if source.is_empty() {
+            warnings.push(format!(
+                "{} capture had no audio samples; transcription audio prepared without this source.",
+                input.label
+            ));
+            continue;
+        }
+        if source.is_silent() {
+            warnings.push(format!(
+                "{} capture contained only silence; transcription audio prepared without this source.",
+                input.label
+            ));
+            continue;
+        }
+
+        sources.push(source);
+    }
+
+    let mixed = mix_audio_sources(&sources);
+    if mixed.is_empty() {
+        let _ = remove_file_if_exists(audio_path);
+        return Err("Recording has no captured audio to transcribe.".to_owned());
+    }
+
+    let samples = prepare_transcription_samples(&mixed)?;
+    write_mono_i16_wav(
+        audio_path,
+        u32::try_from(TRANSCRIPTION_SAMPLE_RATE)
+            .map_err(|_| "Transcription sample rate is invalid.".to_owned())?,
+        &samples,
+    )
+}
+
+fn transcription_audio_metadata_warning(label: &str, error: RawAudioMetadataError) -> String {
+    match error {
+        RawAudioMetadataError::MissingSampleRate => {
+            format!("{label} sample rate was missing; transcription audio prepared without this source.")
+        }
+        RawAudioMetadataError::MissingChannels => {
+            format!("{label} channel count was missing; transcription audio prepared without this source.")
+        }
+        RawAudioMetadataError::MissingSampleFormat
+        | RawAudioMetadataError::UnsupportedSampleFormat => {
+            format!("{label} sample format was unsupported; transcription audio prepared without this source.")
+        }
     }
 }
 
@@ -722,9 +795,15 @@ fn path_to_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{initialize_at, CreateRecordingInput, UpdateRecordingInput};
+    use crate::media::sidecar::AUDIO_FILE_MAGIC;
+    use crate::storage::{
+        initialize_at, CaptureAudioMode, CreateRecordingInput, CreateRecordingSessionInput,
+        FinishRecordingSessionInput, RecordingSessionStatus, UpdateRecordingInput,
+    };
     use std::env;
     use std::ffi::OsString;
+    use std::fs::File;
+    use std::io::{self, BufWriter, Write};
     use std::sync::Mutex;
     use uuid::Uuid;
 
@@ -782,33 +861,17 @@ mod tests {
     #[test]
     fn runs_local_transcription_with_fake_binaries() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let old_ffmpeg = env::var_os(FFMPEG_ENV_VAR);
         let old_whisper = env::var_os(WHISPER_MODEL_ENV_VAR);
         let root =
             std::env::temp_dir().join(format!("metafy-transcription-test-{}", Uuid::new_v4()));
         let state = initialize_at(root.clone()).expect("initialize test storage");
-        let recording = state
-            .create_recording(CreateRecordingInput {
-                title: Some("Transcription source".to_owned()),
-                captured_at: Some(current_timestamp_string()),
-                media_path: None,
-            })
-            .expect("create recording");
-        let media_path_relative = format!("recordings/{}/recording.mp4", recording.id);
-        fs::write(state.resolve_path(&media_path_relative), b"fake mp4").expect("write media");
-        let recording = state
-            .update_recording(UpdateRecordingInput {
-                id: recording.id,
-                title: None,
-                status: Some(RecordingStatus::Completed),
-                media_path: Some(media_path_relative),
-                thumbnail_path: None,
-                duration_ms: Some(4_000),
-                captured_at: None,
-                completed_at: Some(current_timestamp_string()),
-                failure_message: None,
-            })
-            .expect("complete recording");
+        let recording_id = create_finished_synthetic_recording(
+            &state,
+            "transcription-e2e",
+            CaptureAudioMode::Microphone,
+            true,
+            false,
+        );
         fs::write(
             state.whisper_models_directory().join("ggml-small.en.bin"),
             b"fake model",
@@ -817,35 +880,35 @@ mod tests {
 
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir).expect("create bin dir");
-        let fake_ffmpeg = bin_dir.join("ffmpeg");
         let fake_whisper = bin_dir.join("whisper-cli");
-        write_executable(
-            &fake_ffmpeg,
-            r#"#!/bin/sh
-for last do :; done
-printf 'wav' > "$last"
-"#,
-        );
         write_executable(
             &fake_whisper,
             r#"#!/bin/sh
+audio=""
 prefix=""
 while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-f" ]; then
+    shift
+    audio="$1"
+  fi
   if [ "$1" = "-of" ] || [ "$1" = "--output-file" ]; then
     shift
     prefix="$1"
   fi
   shift
 done
+if [ "$(head -c 4 "$audio")" != "RIFF" ]; then
+  echo "expected RIFF WAV" >&2
+  exit 2
+fi
 cat > "${prefix}.json" <<'JSON'
 {"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":2500},"text":"Local transcript."}]}
 JSON
 "#,
         );
-        env::set_var(FFMPEG_ENV_VAR, &fake_ffmpeg);
         env::set_var(WHISPER_MODEL_ENV_VAR, &fake_whisper);
 
-        let result = transcribe_recording(&state, &recording.id, DEFAULT_WHISPER_MODEL)
+        let result = transcribe_recording(&state, &recording_id, DEFAULT_WHISPER_MODEL)
             .expect("transcribe recording");
 
         assert_eq!(result.segment_count, 1);
@@ -865,8 +928,96 @@ JSON
             )
             .is_file());
 
-        restore_env(FFMPEG_ENV_VAR, old_ffmpeg);
         restore_env(WHISPER_MODEL_ENV_VAR, old_whisper);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepares_transcription_wav_from_microphone_audio() {
+        let root =
+            std::env::temp_dir().join(format!("metafy-transcription-test-{}", Uuid::new_v4()));
+        let state = initialize_at(root.clone()).expect("initialize test storage");
+        let recording_id = create_finished_synthetic_recording(
+            &state,
+            "transcription-mic",
+            CaptureAudioMode::Microphone,
+            true,
+            false,
+        );
+
+        let result = extract_recording_audio(&state, &recording_id).expect("extract audio");
+        let samples = assert_wav_samples(&result.audio_path, 160, 6_553);
+
+        assert_eq!(result.recording_id, recording_id);
+        assert!(result.media_path.is_none());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(samples.len(), 160);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepares_transcription_wav_from_source_audio() {
+        let root =
+            std::env::temp_dir().join(format!("metafy-transcription-test-{}", Uuid::new_v4()));
+        let state = initialize_at(root.clone()).expect("initialize test storage");
+        let recording_id = create_finished_synthetic_recording(
+            &state,
+            "transcription-source",
+            CaptureAudioMode::Source,
+            false,
+            true,
+        );
+
+        let result = extract_recording_audio(&state, &recording_id).expect("extract audio");
+        let samples = assert_wav_samples(&result.audio_path, 160, 13_107);
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(samples.len(), 160);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepares_transcription_wav_from_microphone_and_source_audio() {
+        let root =
+            std::env::temp_dir().join(format!("metafy-transcription-test-{}", Uuid::new_v4()));
+        let state = initialize_at(root.clone()).expect("initialize test storage");
+        let recording_id = create_finished_synthetic_recording(
+            &state,
+            "transcription-both",
+            CaptureAudioMode::MicrophoneAndSource,
+            true,
+            true,
+        );
+
+        let result = extract_recording_audio(&state, &recording_id).expect("extract audio");
+        let samples = assert_wav_samples(&result.audio_path, 160, 9_830);
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(samples.len(), 160);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transcription_wav_prep_fails_clearly_without_audio() {
+        let root =
+            std::env::temp_dir().join(format!("metafy-transcription-test-{}", Uuid::new_v4()));
+        let state = initialize_at(root.clone()).expect("initialize test storage");
+        let recording_id = create_finished_synthetic_recording(
+            &state,
+            "transcription-none",
+            CaptureAudioMode::None,
+            false,
+            false,
+        );
+
+        let error = extract_recording_audio(&state, &recording_id)
+            .expect_err("no audio should fail transcription prep");
+
+        assert!(error.contains("no captured audio"), "{error}");
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -885,5 +1036,183 @@ JSON
             Some(value) => env::set_var(name, value),
             None => env::remove_var(name),
         }
+    }
+
+    fn create_finished_synthetic_recording(
+        state: &StorageState,
+        session_id: &str,
+        audio_mode: CaptureAudioMode,
+        write_microphone: bool,
+        write_source: bool,
+    ) -> String {
+        let recording = state
+            .create_recording(CreateRecordingInput {
+                title: Some(session_id.to_owned()),
+                captured_at: Some(current_timestamp_string()),
+                media_path: None,
+            })
+            .expect("create recording");
+        let files = state
+            .prepare_recording_session_files(session_id, &audio_mode)
+            .expect("prepare session files");
+
+        let microphone_block = synthetic_f32_stereo_block(480, 0.2);
+        let source_block = synthetic_f32_stereo_block(480, 0.4);
+        if write_microphone {
+            write_synthetic_audio(
+                files
+                    .microphone_audio_path
+                    .as_deref()
+                    .expect("microphone path"),
+                &[microphone_block.as_slice()],
+            )
+            .expect("write microphone audio");
+        }
+        if write_source {
+            write_synthetic_audio(
+                files.source_audio_path.as_deref().expect("source path"),
+                &[source_block.as_slice()],
+            )
+            .expect("write source audio");
+        }
+
+        let session = state
+            .create_recording_session(CreateRecordingSessionInput {
+                id: session_id.to_owned(),
+                recording_id: recording.id.clone(),
+                temp_directory: files.temp_directory_relative,
+                video_path: files.video_path_relative,
+                audio_path: files.audio_path_relative.clone(),
+                metadata_path: files.metadata_path_relative,
+                video_source_id: "display:1".to_owned(),
+                screen_source_id: "display:1".to_owned(),
+                video_source_kind: "display".to_owned(),
+                video_source_title: "Display 1".to_owned(),
+                video_source_app_name: None,
+                video_source_process_id: None,
+                video_source_window_id: None,
+                microphone_device_id: write_microphone.then(|| "mic:1".to_owned()),
+                include_microphone: audio_mode.includes_microphone(),
+                audio_mode,
+                microphone_audio_path: files.microphone_audio_path_relative.clone(),
+                source_audio_path: files.source_audio_path_relative.clone(),
+                width: Some(2),
+                height: Some(2),
+                frame_rate: crate::recorder::frame_rate(),
+                audio_sample_rate: write_microphone.then_some(48_000),
+                audio_channels: write_microphone.then_some(2),
+                audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                microphone_audio_sample_rate: write_microphone.then_some(48_000),
+                microphone_audio_channels: write_microphone.then_some(2),
+                microphone_audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                source_audio_sample_rate: write_source.then_some(48_000),
+                source_audio_channels: write_source.then_some(2),
+                source_audio_sample_format: write_source.then(|| "f32".to_owned()),
+                started_at: current_timestamp_string(),
+            })
+            .expect("create session");
+        state
+            .finish_recording_session(FinishRecordingSessionInput {
+                id: session.id,
+                status: RecordingSessionStatus::Stopped,
+                width: Some(2),
+                height: Some(2),
+                frame_count: 1,
+                audio_byte_count: if write_microphone {
+                    microphone_block.len() as i64
+                } else {
+                    0
+                },
+                audio_sample_rate: write_microphone.then_some(48_000),
+                audio_channels: write_microphone.then_some(2),
+                audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                microphone_audio_byte_count: if write_microphone {
+                    microphone_block.len() as i64
+                } else {
+                    0
+                },
+                microphone_audio_sample_rate: write_microphone.then_some(48_000),
+                microphone_audio_channels: write_microphone.then_some(2),
+                microphone_audio_sample_format: write_microphone.then(|| "f32".to_owned()),
+                source_audio_byte_count: if write_source {
+                    source_block.len() as i64
+                } else {
+                    0
+                },
+                source_audio_sample_rate: write_source.then_some(48_000),
+                source_audio_channels: write_source.then_some(2),
+                source_audio_sample_format: write_source.then(|| "f32".to_owned()),
+                stopped_at: current_timestamp_string(),
+                duration_ms: 100,
+                failure_message: None,
+            })
+            .expect("finish session");
+        state
+            .update_recording(UpdateRecordingInput {
+                id: recording.id.clone(),
+                title: None,
+                status: Some(RecordingStatus::Completed),
+                media_path: None,
+                thumbnail_path: None,
+                duration_ms: Some(100),
+                captured_at: None,
+                completed_at: Some(current_timestamp_string()),
+                failure_message: None,
+            })
+            .expect("complete recording");
+
+        recording.id
+    }
+
+    fn synthetic_f32_stereo_block(frame_count: usize, sample: f32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(frame_count * 2 * std::mem::size_of::<f32>());
+        for _frame in 0..frame_count {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn write_synthetic_audio(path: &Path, blocks: &[&[u8]]) -> io::Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        writer.write_all(AUDIO_FILE_MAGIC)?;
+
+        for (block_index, block) in blocks.iter().enumerate() {
+            let elapsed_ms = block_index as u64 * 10;
+            writer.write_all(&elapsed_ms.to_le_bytes())?;
+            writer.write_all(&elapsed_ms.to_le_bytes())?;
+            writer.write_all(&elapsed_ms.to_le_bytes())?;
+            writer.write_all(&(block.len() as u32).to_le_bytes())?;
+            writer.write_all(block)?;
+        }
+
+        writer.flush()
+    }
+
+    fn assert_wav_samples(path: &str, expected_len: usize, expected_sample: i16) -> Vec<i16> {
+        let bytes = fs::read(path).expect("read wav");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 1);
+        assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            16_000
+        );
+        assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 16);
+        assert_eq!(&bytes[36..40], b"data");
+
+        let samples = bytes[44..]
+            .chunks_exact(std::mem::size_of::<i16>())
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), expected_len);
+        assert!(
+            (samples[0] - expected_sample).abs() <= 2,
+            "{} did not match {expected_sample}",
+            samples[0]
+        );
+        samples
     }
 }

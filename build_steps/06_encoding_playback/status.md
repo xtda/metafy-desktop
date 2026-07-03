@@ -4,13 +4,13 @@ Current status: Implemented
 
 Progress: 100%
 
-Sign-off: Ready for Review
+Sign-off: Approved by Andrew
 
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 
 ## Checklist
 
-- [x] FFmpeg strategy is implemented or documented.
+- [x] Encoding strategy is implemented or documented.
 - [x] Encoding job creates local MP4.
 - [x] Final MP4 is moved into the recording library.
 - [x] Recording metadata is updated after encode.
@@ -20,9 +20,10 @@ Last updated: 2026-07-01
 
 ## Validation Evidence
 
-- FFmpeg MVP strategy: use `METAFY_FFMPEG_PATH` / `METAFY_FFPROBE_PATH` when set, otherwise resolve `ffmpeg` / `ffprobe` from `PATH`.
+- Historical MVP strategy: command-based encoding and metadata probing were used
+  for this step before the native/GStreamer migration.
 - `cargo fmt --check` from `src-tauri`: passed.
-- `cargo test` from `src-tauri`: 6 passed, including synthetic raw capture to MP4 and thumbnail encode.
+- `cargo test` from `src-tauri`: 70 passed, including synthetic raw capture to MP4, thumbnail encode, audio-mode encode coverage, sidecar readers, audio mixdown, command coverage, and metadata tests.
 - `deno task check`: 0 errors, 0 warnings.
 - `deno task build`: production SvelteKit/static build completed.
 
@@ -32,4 +33,4 @@ Last updated: 2026-07-01
 
 ## Sign-Off
 
-- [ ] Approved by Andrew.
+- [x] Approved by Andrew.

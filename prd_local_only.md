@@ -71,7 +71,7 @@ The system is designed to support future use cases including:
 |                                                |
 | Screen Capture (scap)                          |
 | Audio Capture (cpal)                           |
-| Local Recording / Encoding (FFmpeg)            |
+| Local Recording / Encoding (native/GStreamer)  |
 | Local Transcription (whisper.cpp)              |
 | Local Search Index                             |
 | Local Cache / SQLite                           |
@@ -123,7 +123,9 @@ Microphone
 
 Encoding
 
-- FFmpeg
+- AVFoundation on macOS
+- Media Foundation on Windows
+- GStreamer on Linux
 
 Speech Recognition
 
@@ -165,7 +167,7 @@ cpal
   |
   v
 
-FFmpeg
+Native/GStreamer media backend
 
   |
   v

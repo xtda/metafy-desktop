@@ -6,7 +6,7 @@ Convert captured temporary media into a playable local MP4, move it into the loc
 
 ## PRD Coverage
 
-- FFmpeg encoding
+- MP4 encoding
 - Playable MP4 recording
 - Local library storage
 - Thumbnail generation
@@ -14,8 +14,7 @@ Convert captured temporary media into a playable local MP4, move it into the loc
 
 ## Deliverables
 
-- FFmpeg availability strategy:
-  - bundled sidecar, system binary, or documented MVP assumption
+- Encoding backend availability strategy.
 - Encoding job from temp capture files to `recording.mp4`.
 - Final recording directory move.
 - Metadata update with file path, duration, resolution, frame rate, and status.
@@ -25,7 +24,7 @@ Convert captured temporary media into a playable local MP4, move it into the loc
 
 ## Implementation Notes
 
-- Keep FFmpeg invocation deterministic and logged.
+- Keep encoding deterministic and logged.
 - Never delete source temp files before successful encode and library move.
 - Use local file URLs or safe media serving compatible with Tauri.
 - Store thumbnail path in SQLite.

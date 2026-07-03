@@ -9,7 +9,8 @@ Use this checklist from the packaged app, not from `tauri dev`.
 - [ ] On macOS, build the release app bundle with `deno task bundle:app`.
 - [ ] On Windows or Linux, build with the platform-native Tauri bundle target.
 - [ ] Launch `src-tauri/target/release/bundle/macos/Metafy Desktop.app`.
-- [ ] Confirm FFmpeg and FFprobe are available in Settings or during encode.
+- [ ] Confirm the selected media backend is ready in Settings or during encode.
+- [ ] On Linux, confirm GStreamer and required H.264/AAC plugins are installed.
 - [ ] Confirm whisper.cpp is available in Settings.
 - [ ] Import or place `ggml-small.en.bin` under the app data Whisper model
   directory.

@@ -55,8 +55,9 @@ Overall sign-off: Pending
 ## Current Focus
 
 Step 17 resize normalization is implemented and ready for review.
-Step 18 multi-input encoding is implemented with automated FFmpeg coverage; macOS
-and Windows manual source-capture playback validation remains pending.
+Step 18 multi-input encoding is implemented; macOS and Windows manual
+source-capture playback validation remains pending. Native encoding migration is
+tracked separately in `docs/native_encode/`.
 
 ## Recent Updates
 
@@ -68,11 +69,11 @@ and Windows manual source-capture playback validation remains pending.
 - 2026-07-01: Implemented Step 03 app shell and library UI with recording controls, local recording list, recording detail, transcript/search/settings placeholders, and validation evidence.
 - 2026-07-01: Andrew approved Step 03 App Shell & Library UI.
 - 2026-07-01: Updated the overall tracker to reflect implemented Step 04 capture permissions/devices and Step 05 recording session pipeline detail statuses.
-- 2026-07-01: Implemented Step 06 encoding and playback with system FFmpeg resolution, MP4 output, thumbnail generation, asset-protocol playback, retryable encoding failures, and validation evidence.
-- 2026-07-01: Implemented Step 07 Whisper transcription with local model detection/import, FFmpeg audio extraction, local whisper.cpp invocation, raw JSON storage, timestamped transcript segments, confidence persistence, transcript UI, and retry flow.
+- 2026-07-01: Historical: implemented Step 06 encoding and playback with the original command-encoder MVP, MP4 output, thumbnail generation, asset-protocol playback, retryable encoding failures, and validation evidence.
+- 2026-07-01: Historical: implemented Step 07 Whisper transcription with local model detection/import, command-based audio extraction, local whisper.cpp invocation, raw JSON storage, timestamped transcript segments, confidence persistence, transcript UI, and retry flow.
 - 2026-07-01: Implemented Step 08 local search with a SQLite FTS5 transcript segment index, search/reindex commands, timestamped ranked results, and search-result playback seeking.
 - 2026-07-02: Implemented Step 10 failure recovery and jobs with persisted retry/interruption metadata, startup recovery, queued worker execution, retry/cleanup commands, substep job rows, and UI recovery actions.
-- 2026-07-02: Started Step 11 packaging validation with a release app bundle task, macOS `.app` build evidence, FFmpeg/Whisper resource audit, platform packaging notes, and a packaged-app manual validation checklist.
+- 2026-07-02: Started Step 11 packaging validation with a release app bundle task, macOS `.app` build evidence, Whisper resource audit, platform packaging notes, and a packaged-app manual validation checklist.
 - 2026-07-02: Added Steps 12-18 for expanded macOS/Windows application and window capture, separate microphone/source audio, resize normalization, and multi-input encoding validation.
 - 2026-07-02: Implemented Step 12 capture source model with source-oriented capture payloads, prefixed source id parsing, video-source/audio-mode preferences, stale-source validation, and legacy `screen_source_id` compatibility.
 - 2026-07-02: Implemented Step 13 source picker and audio-mode UI with grouped source options, mode-specific disabled states, stale-source recovery, separate mic/source live indicators, and validation evidence.
@@ -93,7 +94,7 @@ and Windows manual source-capture playback validation remains pending.
   canvas selection, BGRA scale-to-fit normalization before `.mfrv` writes,
   centered opaque-black padding, source-dimension metadata, and automated
   recorder/library test coverage.
-- 2026-07-02: Advanced Step 18 with multi-input FFmpeg encoding support,
+- 2026-07-02: Historical: advanced Step 18 with multi-input command encoding support,
   deterministic microphone + source mixing into one default AAC track,
   missing/silent/unsupported source warnings, split staging-file cleanup,
   synthetic encode coverage for all four audio modes, and macOS/Windows manual

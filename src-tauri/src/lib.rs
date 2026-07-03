@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod encoding;
 mod jobs;
+mod media;
 mod recorder;
 mod source_audio;
 mod storage;

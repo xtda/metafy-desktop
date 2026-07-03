@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -11,14 +11,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::capture::{CaptureVideoSourceKind, SourceAudioCaptureConfig, ValidatedCaptureConfig};
+#[cfg(target_os = "macos")]
+use crate::media::macos_chunked_video::MacosSegmentedVideoWriter;
+#[cfg(not(target_os = "macos"))]
+use crate::media::sidecar::VIDEO_FILE_MAGIC;
+use crate::media::sidecar::{AUDIO_FILE_MAGIC, BGRA_FORMAT_CODE, BGRA_LZ4_FORMAT_CODE};
 use crate::storage::{RecordingSession, RecordingSessionFiles, RecordingSessionStatus};
 
 const CAPTURE_FRAME_RATE: u32 = 30;
-const VIDEO_FILE_MAGIC: &[u8] = b"METAFY_RAW_VIDEO_V1\n";
-const AUDIO_FILE_MAGIC: &[u8] = b"METAFY_RAW_AUDIO_V1\n";
-const BGRA_FORMAT_CODE: u32 = 7;
 const BGRA_BYTES_PER_PIXEL: usize = 4;
 const OPAQUE_BLACK_BGRA: [u8; BGRA_BYTES_PER_PIXEL] = [0x00, 0x00, 0x00, 0xff];
+const MAX_RAW_VIDEO_WIDTH: u32 = 1280;
+const MAX_RAW_VIDEO_HEIGHT: u32 = 720;
+const CHUNKED_VIDEO_DURATION_SECONDS: u32 = 5;
 
 #[derive(Default)]
 pub struct RecordingRuntime {
@@ -255,16 +260,13 @@ impl RecordingRuntime {
         let stats = Arc::new(Mutex::new(CaptureStats::default()));
         let mut capturer = build_video_capturer(&config.video_source.id)?;
         let output_size = capturer.get_output_frame_size();
-        let output_canvas = OutputCanvas::new(output_size[0], output_size[1])?;
+        let output_canvas = OutputCanvas::bounded(output_size[0], output_size[1])?;
         if let Ok(mut stats) = stats.lock() {
             stats.width = Some(i64::from(output_canvas.width));
             stats.height = Some(i64::from(output_canvas.height));
-            stats.source_width = Some(i64::from(output_canvas.width));
-            stats.source_height = Some(i64::from(output_canvas.height));
+            stats.source_width = Some(i64::from(output_size[0]));
+            stats.source_height = Some(i64::from(output_size[1]));
         }
-        let video_file = File::create(&files.video_path)
-            .map_err(|error| format!("Unable to create screen frame file: {error}"))?;
-
         let audio_runtime = if config.include_microphone {
             let audio_path = files.microphone_audio_path.as_ref().ok_or_else(|| {
                 "Microphone capture was enabled without an audio path.".to_owned()
@@ -315,7 +317,7 @@ impl RecordingRuntime {
 
         let screen_handle = spawn_screen_writer(
             config.video_source.id.clone(),
-            video_file,
+            files.video_path.clone(),
             output_canvas,
             Arc::clone(&stop_signal),
             Arc::clone(&stats),
@@ -486,7 +488,7 @@ pub fn write_session_metadata_with_source_dimensions(
         frame_count: session.frame_count,
         video: SessionVideoSidecar {
             path: &session.video_path,
-            format: "metafy raw BGRA frame stream v1",
+            format: video_sidecar_format(&session.video_path),
             source: SessionVideoSourceSidecar {
                 id: &session.video_source_id,
                 kind: &session.video_source_kind,
@@ -549,6 +551,14 @@ pub fn write_session_metadata_with_source_dimensions(
         File::create(path).map_err(|error| format!("Unable to write session metadata: {error}"))?;
     serde_json::to_writer_pretty(file, &sidecar)
         .map_err(|error| format!("Unable to serialize session metadata: {error}"))
+}
+
+fn video_sidecar_format(path: &str) -> &'static str {
+    if crate::media::chunked_video::is_chunked_video_path(path) {
+        "metafy chunked H.264 segment manifest v1"
+    } else {
+        "metafy raw BGRA frame stream v1"
+    }
 }
 
 fn build_video_capturer(source_id: &str) -> Result<scap::capturer::Capturer, String> {
@@ -659,11 +669,42 @@ impl OutputCanvas {
 
         Ok(Self { width, height })
     }
+
+    fn bounded(width: u32, height: u32) -> Result<Self, String> {
+        let canvas = Self::new(width, height)?;
+        if canvas.width <= MAX_RAW_VIDEO_WIDTH && canvas.height <= MAX_RAW_VIDEO_HEIGHT {
+            return Ok(Self {
+                width: even_canvas_dimension(canvas.width),
+                height: even_canvas_dimension(canvas.height),
+            });
+        }
+
+        let source_width = u64::from(canvas.width);
+        let source_height = u64::from(canvas.height);
+        let max_width = u64::from(MAX_RAW_VIDEO_WIDTH);
+        let max_height = u64::from(MAX_RAW_VIDEO_HEIGHT);
+        let (width, height) = if source_width * max_height > max_width * source_height {
+            (
+                MAX_RAW_VIDEO_WIDTH,
+                rounded_ratio(source_height * max_width, source_width),
+            )
+        } else {
+            (
+                rounded_ratio(source_width * max_height, source_height),
+                MAX_RAW_VIDEO_HEIGHT,
+            )
+        };
+
+        Ok(Self {
+            width: even_canvas_dimension(width.clamp(1, MAX_RAW_VIDEO_WIDTH)),
+            height: even_canvas_dimension(height.clamp(1, MAX_RAW_VIDEO_HEIGHT)),
+        })
+    }
 }
 
 fn spawn_screen_writer(
     source_id: String,
-    file: File,
+    video_path: PathBuf,
     output_canvas: OutputCanvas,
     stop_signal: Arc<AtomicBool>,
     stats: Arc<Mutex<CaptureStats>>,
@@ -677,21 +718,20 @@ fn spawn_screen_writer(
                 return;
             }
         };
-        let mut writer = BufWriter::new(file);
-        if let Err(error) = writer.write_all(VIDEO_FILE_MAGIC) {
-            push_error(
-                &stats,
-                format!("Unable to initialize screen frame file: {error}"),
-            );
-            return;
-        }
+        let mut writer = match ScreenFrameWriter::create(&video_path, output_canvas) {
+            Ok(writer) => writer,
+            Err(error) => {
+                push_error(&stats, error);
+                return;
+            }
+        };
 
         capturer.start_capture();
 
         while !stop_signal.load(Ordering::Relaxed) {
             match capturer.get_next_frame() {
                 Ok(frame) => {
-                    if let Err(error) = write_video_frame(
+                    if let Err(error) = process_video_frame(
                         &mut writer,
                         frame,
                         output_canvas,
@@ -713,17 +753,183 @@ fn spawn_screen_writer(
         }
 
         capturer.stop_capture();
-        if let Err(error) = writer.flush() {
-            push_error(
-                &stats,
-                format!("Unable to flush screen frame file: {error}"),
-            );
+        if let Err(error) = writer.finish() {
+            push_error(&stats, error);
         }
     })
 }
 
-fn write_video_frame(
-    writer: &mut BufWriter<File>,
+enum ScreenFrameWriter {
+    #[cfg(not(target_os = "macos"))]
+    Raw(RawScreenFrameWriter),
+    #[cfg(target_os = "macos")]
+    Chunked(ChunkedScreenFrameWriter),
+}
+
+impl ScreenFrameWriter {
+    fn create(path: &Path, output_canvas: OutputCanvas) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        {
+            return ChunkedScreenFrameWriter::create(path, output_canvas).map(Self::Chunked);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            RawScreenFrameWriter::create(path).map(Self::Raw)
+        }
+    }
+
+    fn append(
+        &mut self,
+        frame: &NormalizedVideoFrame<'_>,
+        elapsed_ms: u64,
+        display_time_ms: u64,
+    ) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            Self::Raw(writer) => writer.append(frame, elapsed_ms, display_time_ms),
+            #[cfg(target_os = "macos")]
+            Self::Chunked(writer) => writer.append(frame, elapsed_ms, display_time_ms),
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            Self::Raw(writer) => writer.finish(),
+            #[cfg(target_os = "macos")]
+            Self::Chunked(writer) => writer.finish(),
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct RawScreenFrameWriter {
+    writer: BufWriter<File>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl RawScreenFrameWriter {
+    fn create(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Unable to create screen frame directory: {error}"))?;
+        }
+        let mut writer = BufWriter::new(
+            File::create(path)
+                .map_err(|error| format!("Unable to create screen frame file: {error}"))?,
+        );
+        writer
+            .write_all(VIDEO_FILE_MAGIC)
+            .map_err(|error| format!("Unable to initialize screen frame file: {error}"))?;
+
+        Ok(Self { writer })
+    }
+
+    fn append(
+        &mut self,
+        frame: &NormalizedVideoFrame<'_>,
+        elapsed_ms: u64,
+        display_time_ms: u64,
+    ) -> Result<(), String> {
+        let (format_code, encoded_bytes) = encode_video_frame_bytes(frame.bytes.as_ref());
+        let encoded_byte_count: u32 = encoded_bytes
+            .as_ref()
+            .len()
+            .try_into()
+            .map_err(|_| "Encoded BGRA frame is too large to write.".to_owned())?;
+
+        write_u64(&mut self.writer, elapsed_ms)?;
+        write_u64(&mut self.writer, display_time_ms)?;
+        write_u32(&mut self.writer, format_code)?;
+        write_u32(&mut self.writer, frame.output_width)?;
+        write_u32(&mut self.writer, frame.output_height)?;
+        write_u32(&mut self.writer, encoded_byte_count)?;
+        self.writer
+            .write_all(encoded_bytes.as_ref())
+            .map_err(|error| format!("Unable to write screen frame: {error}"))
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.writer
+            .flush()
+            .map_err(|error| format!("Unable to flush screen frame file: {error}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ChunkedScreenFrameWriter {
+    writer: MacosSegmentedVideoWriter,
+    thumbnail_path: PathBuf,
+    thumbnail_written: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ChunkedScreenFrameWriter {
+    fn create(path: &Path, output_canvas: OutputCanvas) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Unable to create chunked video directory: {error}"))?;
+        }
+        let chunk_frames = i64::from(CAPTURE_FRAME_RATE * CHUNKED_VIDEO_DURATION_SECONDS);
+        let writer = MacosSegmentedVideoWriter::create(
+            path,
+            i64::from(output_canvas.width),
+            i64::from(output_canvas.height),
+            i64::from(CAPTURE_FRAME_RATE),
+            chunk_frames,
+        )?;
+        let thumbnail_path = chunked_thumbnail_path(path);
+
+        Ok(Self {
+            writer,
+            thumbnail_path,
+            thumbnail_written: false,
+        })
+    }
+
+    fn append(
+        &mut self,
+        frame: &NormalizedVideoFrame<'_>,
+        elapsed_ms: u64,
+        display_time_ms: u64,
+    ) -> Result<(), String> {
+        if !self.thumbnail_written {
+            fs::write(&self.thumbnail_path, frame.bytes.as_ref()).map_err(|error| {
+                format!(
+                    "Unable to write chunked video thumbnail frame {}: {error}",
+                    self.thumbnail_path.display()
+                )
+            })?;
+            self.thumbnail_written = true;
+        }
+        self.writer.append_frame(
+            frame.bytes.as_ref(),
+            elapsed_ms
+                .try_into()
+                .map_err(|_| "Video frame elapsed timestamp is too large.".to_owned())?,
+            display_time_ms
+                .try_into()
+                .map_err(|_| "Video frame display timestamp is too large.".to_owned())?,
+        )
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.writer.finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn chunked_thumbnail_path(manifest_path: &Path) -> PathBuf {
+    let base_name = manifest_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("screen_video");
+    manifest_path.with_file_name(format!("{base_name}-thumbnail.bgra"))
+}
+
+fn process_video_frame(
+    writer: &mut ScreenFrameWriter,
     frame: scap::frame::Frame,
     output_canvas: OutputCanvas,
     stats: &Arc<Mutex<CaptureStats>>,
@@ -737,21 +943,11 @@ fn write_video_frame(
         &payload.bytes,
         output_canvas,
     )?;
-    let normalized_byte_count: u32 = normalized
-        .bytes
-        .len()
-        .try_into()
-        .map_err(|_| "Normalized BGRA frame is too large to write.".to_owned())?;
-
-    write_u64(writer, duration_ms_u64(started_instant.elapsed()))?;
-    write_u64(writer, system_time_ms(payload.display_time))?;
-    write_u32(writer, BGRA_FORMAT_CODE)?;
-    write_u32(writer, normalized.output_width)?;
-    write_u32(writer, normalized.output_height)?;
-    write_u32(writer, normalized_byte_count)?;
-    writer
-        .write_all(normalized.bytes.as_ref())
-        .map_err(|error| format!("Unable to write screen frame: {error}"))?;
+    writer.append(
+        &normalized,
+        duration_ms_u64(started_instant.elapsed()),
+        system_time_ms(payload.display_time),
+    )?;
 
     if let Ok(mut stats) = stats.lock() {
         stats.frame_count += 1;
@@ -762,6 +958,15 @@ fn write_video_frame(
     }
 
     Ok(())
+}
+
+fn encode_video_frame_bytes(bytes: &[u8]) -> (u32, Cow<'_, [u8]>) {
+    let compressed = lz4_flex::compress_prepend_size(bytes);
+    if compressed.len() < bytes.len() {
+        (BGRA_LZ4_FORMAT_CODE, Cow::Owned(compressed))
+    } else {
+        (BGRA_FORMAT_CODE, Cow::Borrowed(bytes))
+    }
 }
 
 struct VideoFramePayload {
@@ -878,6 +1083,14 @@ fn rounded_ratio(numerator: u64, denominator: u64) -> u32 {
     ((numerator + (denominator / 2)) / denominator)
         .try_into()
         .unwrap_or(u32::MAX)
+}
+
+fn even_canvas_dimension(value: u32) -> u32 {
+    if value <= 2 {
+        return value.max(1);
+    }
+
+    value - (value % 2)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1386,6 +1599,27 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn bounded_output_canvas_caps_retina_capture() {
+        let canvas = OutputCanvas::bounded(3600, 2338).expect("canvas");
+
+        assert_eq!(canvas.width, 1108);
+        assert_eq!(canvas.height, 720);
+    }
+
+    #[test]
+    fn video_frame_encoding_uses_lz4_when_smaller() {
+        let source = vec![0x80; 128 * 128 * BGRA_BYTES_PER_PIXEL];
+
+        let (format_code, encoded) = encode_video_frame_bytes(&source);
+
+        assert_eq!(format_code, BGRA_LZ4_FORMAT_CODE);
+        assert!(encoded.len() < source.len());
+        let decoded =
+            lz4_flex::decompress_size_prepended(encoded.as_ref()).expect("decompress frame");
+        assert_eq!(decoded, source);
     }
 
     #[test]

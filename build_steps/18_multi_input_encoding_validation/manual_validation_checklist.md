@@ -2,17 +2,17 @@
 
 Last updated: 2026-07-02
 
-Use this checklist with FFmpeg and FFprobe available. The MVP final MP4 should
-contain one default mixed AAC audio track when both microphone and source audio
-are captured.
+Use this checklist with the selected native/GStreamer media backend ready. The
+MVP final MP4 should contain one default mixed AAC audio track when both
+microphone and source audio are captured.
 
 ## Setup
 
 - [ ] Start from a clean build of the current Step 18 branch.
 - [ ] Confirm `cargo test --lib` passes before manual validation.
 - [ ] Confirm `deno task check` passes before manual validation.
-- [ ] Confirm FFmpeg and FFprobe are discoverable by the app or through
-  `METAFY_FFMPEG_PATH` and `METAFY_FFPROBE_PATH`.
+- [ ] Confirm the selected media backend is ready in Settings or during encode.
+- [ ] On Linux, confirm GStreamer and required H.264/AAC plugins are installed.
 - [ ] Use local app data only; do not upload raw recording sidecars.
 
 ## macOS
@@ -57,9 +57,9 @@ are captured.
 ## Playback And Artifacts
 
 - [ ] Each final `recording.mp4` plays from the recording detail view.
-- [ ] FFprobe reports one video stream for every final MP4.
-- [ ] FFprobe reports no audio stream for video-only recordings.
-- [ ] FFprobe reports one default audio stream for microphone-only,
+- [ ] Playback confirms a video stream for every final MP4.
+- [ ] Playback confirms no audible audio for video-only recordings.
+- [ ] Playback confirms one default audible track for microphone-only,
   source-only, and microphone + source recordings.
 - [ ] The final MP4 path, thumbnail path, duration, dimensions, and completed
   status are persisted after successful encode.

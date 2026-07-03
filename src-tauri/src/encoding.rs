@@ -1,19 +1,42 @@
 use serde::Serialize;
-use serde_json::Value;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use crate::binaries::{find_binary, missing_binary_message};
-use crate::storage::{CaptureAudioMode, RecordingSession, StorageState};
+use crate::media::audio::{
+    mix_audio_sources, prepare_audio_source, write_f32le_samples, FINAL_ENCODE_CHANNELS,
+    FINAL_ENCODE_SAMPLE_FORMAT, FINAL_ENCODE_SAMPLE_RATE,
+};
+#[cfg(target_os = "linux")]
+use crate::media::backends::linux_gstreamer::LinuxGstreamerRecordingEncoder;
+#[cfg(target_os = "macos")]
+use crate::media::backends::macos::MacosRecordingEncoder;
+#[cfg(target_os = "windows")]
+use crate::media::backends::windows::WindowsRecordingEncoder;
+use crate::media::chunked_video::{
+    read_manifest as read_chunked_video_manifest, read_thumbnail_frame as read_chunked_thumbnail,
+    try_read_manifest as try_read_chunked_video_manifest, ChunkedVideoStatus,
+};
+use crate::media::encode::{
+    EncodeAudioInput, EncodeCommandDiagnostics, EncodeInput, EncodeOutput, EncodeOutputPaths,
+    EncodeVideoFormat, EncodeVideoInput, RecordingEncoder,
+};
+use crate::media::metadata::{duration_ms_from_frames, MediaInfo};
+use crate::media::sidecar::{
+    RawAudioFormat, RawAudioMetadataError, RawAudioReader, RawVideoReader,
+};
+use crate::media::sidecar_selection::{
+    select_requested_audio_sidecars, AudioSidecarInput, AudioSidecarPurpose,
+};
+use crate::media::thumbnail::BgraFrame;
+use crate::storage::StorageState;
 
-const VIDEO_FILE_MAGIC: &[u8] = b"METAFY_RAW_VIDEO_V1\n";
-const AUDIO_FILE_MAGIC: &[u8] = b"METAFY_RAW_AUDIO_V1\n";
-const BGRA_FORMAT_CODE: u32 = 7;
-const LEGACY_STAGING_AUDIO_FILE_NAME: &str = "encoding-audio.raw";
+const STAGING_AUDIO_FILE_NAME: &str = "encoding-audio.raw";
 const MICROPHONE_STAGING_AUDIO_FILE_NAME: &str = "encoding-microphone.raw";
 const SOURCE_STAGING_AUDIO_FILE_NAME: &str = "encoding-source.raw";
+const MAX_ENCODE_WIDTH: u32 = 1920;
+const MAX_ENCODE_HEIGHT: u32 = 1080;
+const BGRA_BYTES_PER_PIXEL: usize = 4;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,43 +52,30 @@ pub struct EncodingResult {
     pub frame_rate: i64,
     pub frame_count: i64,
     pub audio_included: bool,
-    pub ffmpeg_path: String,
-    pub ffmpeg_args: Vec<String>,
-    pub thumbnail_args: Vec<String>,
-    pub ffprobe_path: Option<String>,
-    pub ffprobe_json: Option<Value>,
+    pub media_info: MediaInfo,
+    pub backend_id: String,
+    pub backend_label: String,
+    pub backend_commands: Vec<EncodeCommandDiagnostics>,
+    pub backend_messages: Vec<String>,
     pub warnings: Vec<String>,
 }
 
 struct PreparedVideo {
+    path: PathBuf,
+    format: EncodeVideoFormat,
+    temporary_path: Option<PathBuf>,
     width: i64,
     height: i64,
     frame_count: i64,
-}
-
-struct PreparedAudio {
-    byte_count: i64,
-}
-
-struct EncodingAudioInput {
-    path: PathBuf,
-    label: &'static str,
-    staging_file_name: &'static str,
-    sample_rate: Option<i64>,
-    channels: Option<i64>,
-    sample_format: Option<String>,
+    thumbnail_frame: BgraFrame,
 }
 
 struct PreparedAudioInput {
     path: PathBuf,
     sample_rate: i64,
     channels: i64,
-    ffmpeg_format: &'static str,
-}
-
-struct CommandOutput {
-    program: PathBuf,
-    args: Vec<String>,
+    sample_format: String,
+    duration_ms: Option<i64>,
 }
 
 pub fn encode_recording(
@@ -86,14 +96,22 @@ pub fn encode_recording(
         .map_err(|error| error.to_string())?;
     let source_video_path = storage.resolve_path(&session.video_path);
     let mut warnings = Vec::new();
-    let encoding_audio_inputs = select_encoding_audio_inputs(storage, &session, &mut warnings);
+    let encoding_audio_inputs = select_requested_audio_sidecars(
+        storage,
+        &session,
+        AudioSidecarPurpose::Encoding,
+        &mut warnings,
+    );
     let staging_video_path = media_files.recording_directory.join("encoding-video.bgra");
+    let staging_audio_path = media_files
+        .recording_directory
+        .join(STAGING_AUDIO_FILE_NAME);
     let staging_media_path = media_files.recording_directory.join("recording.tmp.mp4");
     let staging_thumbnail_path = media_files.recording_directory.join("thumbnail.tmp.jpg");
 
     remove_file_if_exists(&staging_video_path)?;
     for file_name in [
-        LEGACY_STAGING_AUDIO_FILE_NAME,
+        STAGING_AUDIO_FILE_NAME,
         MICROPHONE_STAGING_AUDIO_FILE_NAME,
         SOURCE_STAGING_AUDIO_FILE_NAME,
     ] {
@@ -102,166 +120,174 @@ pub fn encode_recording(
     remove_file_if_exists(&staging_media_path)?;
     remove_file_if_exists(&staging_thumbnail_path)?;
 
-    let prepared_video = prepare_video_frames(
+    let prepared_video = prepare_video_input(
         &source_video_path,
         &staging_video_path,
         session.width,
         session.height,
+        &mut warnings,
     )?;
-    let mut prepared_audio_inputs = Vec::new();
-    for audio_input in encoding_audio_inputs {
-        let staging_audio_path = media_files
-            .recording_directory
-            .join(audio_input.staging_file_name);
-        if let Some(prepared_audio) =
-            prepare_encoding_audio_input(audio_input, staging_audio_path, &mut warnings)?
-        {
-            prepared_audio_inputs.push(prepared_audio);
-        }
-    }
-    let audio_included = !prepared_audio_inputs.is_empty();
-
-    let ffmpeg_path = find_binary("METAFY_FFMPEG_PATH", &["ffmpeg"])
-        .ok_or_else(|| missing_binary_message("ffmpeg", "METAFY_FFMPEG_PATH"))?;
-    let encode_command = build_encode_command(
-        &ffmpeg_path,
-        &staging_video_path,
-        prepared_video.width,
-        prepared_video.height,
-        session.frame_rate,
-        &prepared_audio_inputs,
-        &staging_media_path,
-    )?;
-    run_logged_command(&encode_command, "FFmpeg encode")?;
-
-    rename_replace(&staging_media_path, &media_files.media_path)?;
-
-    let thumbnail_command = build_thumbnail_command(
-        &ffmpeg_path,
-        &media_files.media_path,
-        &staging_thumbnail_path,
-    );
-    let thumbnail_result = match run_logged_command(&thumbnail_command, "FFmpeg thumbnail") {
-        Ok(()) => {
-            rename_replace(&staging_thumbnail_path, &media_files.thumbnail_path)?;
-            Some(media_files.thumbnail_path_relative.clone())
-        }
-        Err(error) => {
-            let _ = remove_file_if_exists(&staging_thumbnail_path);
-            return Err(format!("Thumbnail generation failed: {error}"));
-        }
-    };
-
-    let ffprobe_path = find_binary("METAFY_FFPROBE_PATH", &["ffprobe"]);
-    let ffprobe_json = match ffprobe_path.as_ref() {
-        Some(path) => match run_ffprobe(path, &media_files.media_path) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warnings.push(format!("FFprobe metadata failed: {error}"));
-                None
-            }
+    let prepared_audio_input =
+        prepare_encoding_audio_inputs(encoding_audio_inputs, staging_audio_path, &mut warnings)?;
+    let prepared_audio_inputs = prepared_audio_input.into_iter().collect::<Vec<_>>();
+    let encode_input = EncodeInput {
+        recording_id: recording_id.to_owned(),
+        video: EncodeVideoInput {
+            path: prepared_video.path.clone(),
+            format: prepared_video.format,
+            width: prepared_video.width,
+            height: prepared_video.height,
+            frame_rate: session.frame_rate,
+            frame_count: prepared_video.frame_count,
+            thumbnail_frame: prepared_video.thumbnail_frame.clone(),
         },
-        None => {
-            warnings.push(missing_binary_message("ffprobe", "METAFY_FFPROBE_PATH"));
-            None
-        }
+        audio_inputs: prepared_audio_inputs
+            .iter()
+            .map(|audio_input| EncodeAudioInput {
+                path: audio_input.path.clone(),
+                sample_rate: audio_input.sample_rate,
+                channels: audio_input.channels,
+                sample_format: audio_input.sample_format.clone(),
+                duration_ms: audio_input.duration_ms,
+            })
+            .collect(),
+        output: EncodeOutputPaths {
+            media_path: media_files.media_path,
+            media_path_relative: media_files.media_path_relative,
+            thumbnail_path: media_files.thumbnail_path,
+            thumbnail_path_relative: media_files.thumbnail_path_relative,
+            staging_media_path,
+            staging_thumbnail_path,
+        },
+        duration_hint_ms: session.duration_ms,
+        warnings,
     };
+    let (backend_output, backend_label) = encode_with_platform_backend(encode_input)?;
 
-    let _ = remove_file_if_exists(&staging_video_path);
+    if let Some(path) = prepared_video.temporary_path.as_ref() {
+        let _ = remove_file_if_exists(path);
+    }
     for audio_input in &prepared_audio_inputs {
         let _ = remove_file_if_exists(&audio_input.path);
     }
 
-    Ok(EncodingResult {
-        recording_id: recording_id.to_owned(),
-        media_path: media_files.media_path_relative,
-        thumbnail_path: thumbnail_result,
-        absolute_media_path: path_to_string(&media_files.media_path),
-        absolute_thumbnail_path: media_files
-            .thumbnail_path
-            .exists()
-            .then(|| path_to_string(&media_files.thumbnail_path)),
-        duration_ms: probe_duration_ms(ffprobe_json.as_ref()).or(session.duration_ms),
-        width: prepared_video.width,
-        height: prepared_video.height,
-        frame_rate: session.frame_rate,
-        frame_count: prepared_video.frame_count,
-        audio_included,
-        ffmpeg_path: path_to_string(&ffmpeg_path),
-        ffmpeg_args: encode_command.args,
-        thumbnail_args: thumbnail_command.args,
-        ffprobe_path: ffprobe_path.as_ref().map(|path| path_to_string(path)),
-        ffprobe_json,
-        warnings,
-    })
+    Ok(encoding_result_from_backend(backend_output, backend_label))
 }
 
-fn select_encoding_audio_inputs(
-    storage: &StorageState,
-    session: &RecordingSession,
+#[cfg(target_os = "macos")]
+fn encode_with_platform_backend(input: EncodeInput) -> Result<(EncodeOutput, String), String> {
+    let encoder = MacosRecordingEncoder::new();
+    let backend_label = encoder.backend_label();
+    let output = encoder.encode(input)?;
+
+    Ok((output, backend_label))
+}
+
+#[cfg(target_os = "windows")]
+fn encode_with_platform_backend(input: EncodeInput) -> Result<(EncodeOutput, String), String> {
+    let encoder = WindowsRecordingEncoder::new();
+    let backend_label = encoder.backend_label();
+    let output = encoder.encode(input)?;
+
+    Ok((output, backend_label))
+}
+
+#[cfg(target_os = "linux")]
+fn encode_with_platform_backend(input: EncodeInput) -> Result<(EncodeOutput, String), String> {
+    let encoder = LinuxGstreamerRecordingEncoder::new()?;
+    let backend_label = encoder.backend_label();
+    let output = encoder.encode(input)?;
+
+    Ok((output, backend_label))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn encode_with_platform_backend(_input: EncodeInput) -> Result<(EncodeOutput, String), String> {
+    let readiness = crate::media::readiness::selected_media_backend_readiness();
+    let action = readiness.user_action.unwrap_or_else(|| {
+        "Run Metafy Desktop on macOS, Windows, or Linux for media processing.".to_owned()
+    });
+
+    Err(format!(
+        "No media encoding backend is available for this platform. {action}"
+    ))
+}
+
+fn encoding_result_from_backend(output: EncodeOutput, backend_label: String) -> EncodingResult {
+    let backend_id = output.diagnostics.backend.clone();
+    let backend_commands = output.diagnostics.commands.clone();
+    let backend_messages = output.diagnostics.messages.clone();
+
+    EncodingResult {
+        recording_id: output.recording_id,
+        media_path: output.media_path,
+        thumbnail_path: output.thumbnail_path,
+        absolute_media_path: output.absolute_media_path,
+        absolute_thumbnail_path: output.absolute_thumbnail_path,
+        duration_ms: output.duration_ms,
+        width: output.width,
+        height: output.height,
+        frame_rate: output.frame_rate,
+        frame_count: output.frame_count,
+        audio_included: output.audio_included,
+        media_info: output.media_info,
+        backend_id,
+        backend_label,
+        backend_commands,
+        backend_messages,
+        warnings: output.warnings,
+    }
+}
+
+fn prepare_video_input(
+    source_path: &Path,
+    raw_output_path: &Path,
+    expected_width: Option<i64>,
+    expected_height: Option<i64>,
     warnings: &mut Vec<String>,
-) -> Vec<EncodingAudioInput> {
-    let mut inputs = Vec::new();
-    let microphone_path = session
-        .microphone_audio_path
-        .as_deref()
-        .or_else(|| legacy_microphone_audio_path(session));
-
-    if session.audio_mode.includes_microphone() {
-        if let Some(path) = microphone_path {
-            inputs.push(EncodingAudioInput {
-                path: storage.resolve_path(path),
-                label: "microphone audio",
-                staging_file_name: MICROPHONE_STAGING_AUDIO_FILE_NAME,
-                sample_rate: session.microphone_audio_sample_rate,
-                channels: session.microphone_audio_channels,
-                sample_format: session.microphone_audio_sample_format.clone(),
-            });
-        } else {
-            warnings.push(
-                "microphone audio was requested but no capture file was recorded; encoded without microphone audio."
-                    .to_owned(),
-            );
-        }
-    } else if session.audio_mode == CaptureAudioMode::None {
-        if let Some(path) = legacy_microphone_audio_path(session) {
-            inputs.push(EncodingAudioInput {
-                path: storage.resolve_path(path),
-                label: "microphone audio",
-                staging_file_name: MICROPHONE_STAGING_AUDIO_FILE_NAME,
-                sample_rate: session.audio_sample_rate,
-                channels: session.audio_channels,
-                sample_format: session.audio_sample_format.clone(),
-            });
-        }
+) -> Result<PreparedVideo, String> {
+    if try_read_chunked_video_manifest(source_path)?.is_some() {
+        return prepare_chunked_video(source_path, warnings);
     }
 
-    if session.audio_mode.includes_source_audio() {
-        if let Some(path) = session.source_audio_path.as_deref() {
-            inputs.push(EncodingAudioInput {
-                path: storage.resolve_path(path),
-                label: "source audio",
-                staging_file_name: SOURCE_STAGING_AUDIO_FILE_NAME,
-                sample_rate: session.source_audio_sample_rate,
-                channels: session.source_audio_channels,
-                sample_format: session.source_audio_sample_format.clone(),
-            });
-        } else {
-            warnings.push(
-                "source audio was requested but no capture file was recorded; encoded without source audio."
-                    .to_owned(),
-            );
-        }
-    }
+    let mut prepared = prepare_video_frames(
+        source_path,
+        raw_output_path,
+        expected_width,
+        expected_height,
+    )?;
+    prepared.path = raw_output_path.to_path_buf();
+    prepared.format = EncodeVideoFormat::RawBgra;
+    prepared.temporary_path = Some(raw_output_path.to_path_buf());
 
-    inputs
+    Ok(prepared)
 }
 
-fn legacy_microphone_audio_path(session: &RecordingSession) -> Option<&str> {
-    session
-        .audio_path
-        .as_deref()
-        .filter(|_| session.audio_mode != CaptureAudioMode::Source)
+fn prepare_chunked_video(
+    source_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<PreparedVideo, String> {
+    let manifest = read_chunked_video_manifest(source_path)?;
+    if manifest.status != ChunkedVideoStatus::Completed {
+        warnings.push(
+            "Encoding recovered finalized video chunks from an interrupted recording manifest."
+                .to_owned(),
+        );
+    }
+    let thumbnail_frame = read_chunked_thumbnail(source_path, &manifest)?;
+
+    Ok(PreparedVideo {
+        path: source_path.to_path_buf(),
+        format: EncodeVideoFormat::ChunkedH264Segments,
+        temporary_path: None,
+        width: i64::from(manifest.width),
+        height: i64::from(manifest.height),
+        frame_count: manifest
+            .frame_count
+            .try_into()
+            .map_err(|_| "Chunked video frame count is too large.".to_owned())?,
+        thumbnail_frame,
+    })
 }
 
 fn prepare_video_frames(
@@ -270,12 +296,7 @@ fn prepare_video_frames(
     expected_width: Option<i64>,
     expected_height: Option<i64>,
 ) -> Result<PreparedVideo, String> {
-    let mut reader = BufReader::new(
-        File::open(source_path)
-            .map_err(|error| format!("Unable to open captured screen frames: {error}"))?,
-    );
-    expect_magic(&mut reader, VIDEO_FILE_MAGIC, "screen frame")?;
-
+    let mut reader = RawVideoReader::open(source_path)?;
     let mut writer = BufWriter::new(
         File::create(output_path)
             .map_err(|error| format!("Unable to prepare video encoding input: {error}"))?,
@@ -283,25 +304,12 @@ fn prepare_video_frames(
     let mut frame_count = 0_i64;
     let mut width = expected_width.unwrap_or_default();
     let mut height = expected_height.unwrap_or_default();
+    let mut output_dimensions = None;
+    let mut thumbnail_frame = None;
 
-    while read_u64_optional(&mut reader)
-        .map_err(|error| format!("Unable to read screen frame timestamp: {error}"))?
-        .is_some()
-    {
-        let _display_time_ms = read_u64(&mut reader)?;
-        let format_code = read_u32(&mut reader)?;
-        let frame_width = i64::from(read_u32(&mut reader)?);
-        let frame_height = i64::from(read_u32(&mut reader)?);
-        let byte_count = read_u32(&mut reader)? as usize;
-
-        if format_code != BGRA_FORMAT_CODE {
-            return Err(format!(
-                "Unsupported captured frame format {format_code}; expected BGRA."
-            ));
-        }
-        if frame_width <= 0 || frame_height <= 0 {
-            return Err("Captured frame dimensions are invalid.".to_owned());
-        }
+    while let Some(frame) = reader.next_frame()? {
+        let frame_width = i64::from(frame.width);
+        let frame_height = i64::from(frame.height);
 
         if width == 0 {
             width = frame_width;
@@ -315,19 +323,30 @@ fn prepare_video_frames(
             ));
         }
 
-        let expected_byte_count = frame_byte_count(width, height)?;
-        if byte_count != expected_byte_count {
-            return Err(format!(
-                "Captured frame has {byte_count} bytes; expected {expected_byte_count} for {width}x{height} BGRA."
-            ));
+        let (output_width, output_height) = *output_dimensions
+            .get_or_insert_with(|| bounded_encode_dimensions(frame.width, frame.height));
+        let output_bytes = if frame.width == output_width && frame.height == output_height {
+            frame.bytes
+        } else {
+            resize_bgra_nearest(
+                &frame.bytes,
+                frame.width,
+                frame.height,
+                output_width,
+                output_height,
+            )?
+        };
+
+        if thumbnail_frame.is_none() {
+            thumbnail_frame = Some(BgraFrame {
+                width: output_width,
+                height: output_height,
+                bytes: output_bytes.clone(),
+            });
         }
 
-        let mut frame = vec![0_u8; byte_count];
-        reader
-            .read_exact(&mut frame)
-            .map_err(|error| format!("Unable to read captured screen frame: {error}"))?;
         writer
-            .write_all(&frame)
+            .write_all(&output_bytes)
             .map_err(|error| format!("Unable to write video encoding input: {error}"))?;
         frame_count += 1;
     }
@@ -340,360 +359,221 @@ fn prepare_video_frames(
         return Err("Captured screen frame file had no frames.".to_owned());
     }
 
+    let (output_width, output_height) =
+        output_dimensions.ok_or_else(|| "Captured screen frame file had no frames.".to_owned())?;
+
     Ok(PreparedVideo {
-        width,
-        height,
+        path: output_path.to_path_buf(),
+        format: EncodeVideoFormat::RawBgra,
+        temporary_path: Some(output_path.to_path_buf()),
+        width: i64::from(output_width),
+        height: i64::from(output_height),
         frame_count,
+        thumbnail_frame: thumbnail_frame
+            .ok_or_else(|| "Captured screen frame file had no thumbnail frame.".to_owned())?,
     })
 }
 
-fn prepare_audio_samples(
-    source_path: &Path,
-    output_path: &Path,
-    label: &str,
-) -> Result<PreparedAudio, String> {
-    let mut reader = BufReader::new(
-        File::open(source_path)
-            .map_err(|error| format!("Unable to open captured {label}: {error}"))?,
-    );
-    expect_magic(&mut reader, AUDIO_FILE_MAGIC, label)?;
-
-    let mut writer = BufWriter::new(
-        File::create(output_path)
-            .map_err(|error| format!("Unable to prepare audio encoding input: {error}"))?,
-    );
-    let mut byte_count = 0_i64;
-
-    while read_u64_optional(&mut reader)
-        .map_err(|error| format!("Unable to read {label} block timestamp: {error}"))?
-        .is_some()
-    {
-        let _callback_stream_ns = read_u64(&mut reader)?;
-        let _capture_stream_ns = read_u64(&mut reader)?;
-        let block_byte_count = read_u32(&mut reader)? as usize;
-        let mut block = vec![0_u8; block_byte_count];
-        reader
-            .read_exact(&mut block)
-            .map_err(|error| format!("Unable to read {label} block: {error}"))?;
-        writer
-            .write_all(&block)
-            .map_err(|error| format!("Unable to write audio encoding input: {error}"))?;
-        byte_count += block_byte_count as i64;
+fn bounded_encode_dimensions(width: u32, height: u32) -> (u32, u32) {
+    if width <= MAX_ENCODE_WIDTH && height <= MAX_ENCODE_HEIGHT {
+        return (even_encode_dimension(width), even_encode_dimension(height));
     }
 
+    let source_width = u64::from(width);
+    let source_height = u64::from(height);
+    let max_width = u64::from(MAX_ENCODE_WIDTH);
+    let max_height = u64::from(MAX_ENCODE_HEIGHT);
+
+    let (scaled_width, scaled_height) = if source_width * max_height > max_width * source_height {
+        (
+            MAX_ENCODE_WIDTH,
+            rounded_ratio_u32(source_height * max_width, source_width),
+        )
+    } else {
+        (
+            rounded_ratio_u32(source_width * max_height, source_height),
+            MAX_ENCODE_HEIGHT,
+        )
+    };
+
+    (
+        even_encode_dimension(scaled_width.clamp(1, MAX_ENCODE_WIDTH)),
+        even_encode_dimension(scaled_height.clamp(1, MAX_ENCODE_HEIGHT)),
+    )
+}
+
+fn rounded_ratio_u32(numerator: u64, denominator: u64) -> u32 {
+    if denominator == 0 {
+        return 1;
+    }
+
+    ((numerator + (denominator / 2)) / denominator)
+        .max(1)
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn even_encode_dimension(value: u32) -> u32 {
+    if value <= 2 {
+        return value.max(1);
+    }
+
+    value - (value % 2)
+}
+
+fn resize_bgra_nearest(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Result<Vec<u8>, String> {
+    let expected_source_byte_count = bgra_byte_count(source_width, source_height)?;
+    if source.len() != expected_source_byte_count {
+        return Err(format!(
+            "Captured BGRA frame has {} bytes; expected {expected_source_byte_count} for {source_width}x{source_height}.",
+            source.len()
+        ));
+    }
+
+    let mut output = vec![0_u8; bgra_byte_count(output_width, output_height)?];
+    let source_width = source_width as usize;
+    let source_height = source_height as usize;
+    let output_width = output_width as usize;
+    let output_height = output_height as usize;
+
+    for target_y in 0..output_height {
+        let source_y = (target_y * source_height) / output_height;
+        for target_x in 0..output_width {
+            let source_x = (target_x * source_width) / output_width;
+            let source_index = (source_y * source_width + source_x) * BGRA_BYTES_PER_PIXEL;
+            let output_index = (target_y * output_width + target_x) * BGRA_BYTES_PER_PIXEL;
+
+            output[output_index..output_index + BGRA_BYTES_PER_PIXEL]
+                .copy_from_slice(&source[source_index..source_index + BGRA_BYTES_PER_PIXEL]);
+        }
+    }
+
+    Ok(output)
+}
+
+fn bgra_byte_count(width: u32, height: u32) -> Result<usize, String> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(BGRA_BYTES_PER_PIXEL))
+        .ok_or_else(|| "BGRA frame dimensions are too large.".to_owned())
+}
+
+fn prepare_encoding_audio_inputs(
+    inputs: Vec<AudioSidecarInput>,
+    staging_path: PathBuf,
+    warnings: &mut Vec<String>,
+) -> Result<Option<PreparedAudioInput>, String> {
+    let mut sources = Vec::new();
+
+    for input in inputs {
+        if !input.path.exists() {
+            warnings.push(format!(
+                "{} was requested but the capture file was missing; encoded without this source.",
+                input.label
+            ));
+            continue;
+        }
+
+        let format = match RawAudioFormat::from_session_metadata(
+            input.sample_rate,
+            input.channels,
+            input.sample_format,
+        ) {
+            Ok(format) => format,
+            Err(error) => {
+                warnings.push(audio_metadata_warning(input.label, error));
+                continue;
+            }
+        };
+        let mut reader = match RawAudioReader::open(&input.path, format) {
+            Ok(reader) => reader,
+            Err(error) => {
+                warnings.push(format!(
+                    "Unable to read captured {}: {error}; encoded without this source.",
+                    input.label
+                ));
+                continue;
+            }
+        };
+        let source = match prepare_audio_source(&mut reader) {
+            Ok(source) => source,
+            Err(error) => {
+                warnings.push(format!(
+                    "Unable to prepare captured {}: {error}; encoded without this source.",
+                    input.label
+                ));
+                continue;
+            }
+        };
+
+        if source.is_empty() {
+            warnings.push(format!(
+                "{} capture had no audio samples; encoded without this source.",
+                input.label
+            ));
+            continue;
+        }
+        if source.is_silent() {
+            warnings.push(format!(
+                "{} capture contained only silence; encoded without this source.",
+                input.label
+            ));
+            continue;
+        }
+
+        sources.push(source);
+    }
+
+    let mixed = mix_audio_sources(&sources);
+    if mixed.is_empty() {
+        let _ = remove_file_if_exists(&staging_path);
+        return Ok(None);
+    }
+    let duration_ms = i64::try_from(mixed.frame_count())
+        .ok()
+        .and_then(|frame_count| duration_ms_from_frames(frame_count, mixed.sample_rate));
+
+    let mut bytes = Vec::new();
+    write_f32le_samples(&mixed.samples, &mut bytes);
+    let mut writer = BufWriter::new(
+        File::create(&staging_path)
+            .map_err(|error| format!("Unable to prepare audio encoding input: {error}"))?,
+    );
+    writer
+        .write_all(&bytes)
+        .map_err(|error| format!("Unable to write audio encoding input: {error}"))?;
     writer
         .flush()
         .map_err(|error| format!("Unable to flush audio encoding input: {error}"))?;
 
-    Ok(PreparedAudio { byte_count })
-}
-
-fn prepare_encoding_audio_input(
-    input: EncodingAudioInput,
-    staging_path: PathBuf,
-    warnings: &mut Vec<String>,
-) -> Result<Option<PreparedAudioInput>, String> {
-    if !input.path.exists() {
-        warnings.push(format!(
-            "{} was requested but the capture file was missing; encoded without this source.",
-            input.label
-        ));
-        return Ok(None);
-    }
-
-    let audio = prepare_audio_samples(&input.path, &staging_path, input.label)?;
-    if audio.byte_count == 0 {
-        warnings.push(format!(
-            "{} capture had no audio samples; encoded without this source.",
-            input.label
-        ));
-        let _ = remove_file_if_exists(&staging_path);
-        return Ok(None);
-    }
-
-    let Some(sample_rate) = input.sample_rate.filter(|value| *value > 0) else {
-        warnings.push(format!(
-            "{} sample rate was missing; encoded without this source.",
-            input.label
-        ));
-        let _ = remove_file_if_exists(&staging_path);
-        return Ok(None);
-    };
-    let Some(channels) = input.channels.filter(|value| *value > 0) else {
-        warnings.push(format!(
-            "{} channel count was missing; encoded without this source.",
-            input.label
-        ));
-        let _ = remove_file_if_exists(&staging_path);
-        return Ok(None);
-    };
-    let Some(ffmpeg_format) = input.sample_format.as_deref().and_then(ffmpeg_audio_format) else {
-        warnings.push(format!(
-            "{} sample format was unsupported by the encoder; encoded without this source.",
-            input.label
-        ));
-        let _ = remove_file_if_exists(&staging_path);
-        return Ok(None);
-    };
-
     Ok(Some(PreparedAudioInput {
         path: staging_path,
-        sample_rate,
-        channels,
-        ffmpeg_format,
+        sample_rate: FINAL_ENCODE_SAMPLE_RATE,
+        channels: FINAL_ENCODE_CHANNELS,
+        sample_format: FINAL_ENCODE_SAMPLE_FORMAT.to_owned(),
+        duration_ms,
     }))
 }
 
-fn build_encode_command(
-    ffmpeg_path: &Path,
-    video_path: &Path,
-    width: i64,
-    height: i64,
-    frame_rate: i64,
-    audio_inputs: &[PreparedAudioInput],
-    output_path: &Path,
-) -> Result<CommandOutput, String> {
-    let mut args = vec![
-        "-hide_banner".to_owned(),
-        "-y".to_owned(),
-        "-f".to_owned(),
-        "rawvideo".to_owned(),
-        "-pix_fmt".to_owned(),
-        "bgra".to_owned(),
-        "-video_size".to_owned(),
-        format!("{width}x{height}"),
-        "-framerate".to_owned(),
-        frame_rate.to_string(),
-        "-i".to_owned(),
-        path_to_string(video_path),
-    ];
-
-    for audio_input in audio_inputs {
-        args.extend([
-            "-f".to_owned(),
-            audio_input.ffmpeg_format.to_owned(),
-            "-ar".to_owned(),
-            audio_input.sample_rate.to_string(),
-            "-ac".to_owned(),
-            audio_input.channels.to_string(),
-            "-i".to_owned(),
-            path_to_string(&audio_input.path),
-        ]);
-    }
-
-    if audio_inputs.len() > 1 {
-        args.extend([
-            "-filter_complex".to_owned(),
-            mixed_audio_filter(audio_inputs.len()),
-        ]);
-    }
-
-    args.extend(["-map".to_owned(), "0:v:0".to_owned()]);
-
-    match audio_inputs.len() {
-        0 => args.push("-an".to_owned()),
-        1 => args.extend(["-map".to_owned(), "1:a:0".to_owned()]),
-        _ => args.extend(["-map".to_owned(), "[mixed_audio]".to_owned()]),
-    }
-
-    args.extend([
-        "-c:v".to_owned(),
-        "libx264".to_owned(),
-        "-preset".to_owned(),
-        "veryfast".to_owned(),
-        "-crf".to_owned(),
-        "23".to_owned(),
-        "-pix_fmt".to_owned(),
-        "yuv420p".to_owned(),
-    ]);
-
-    if !audio_inputs.is_empty() {
-        args.extend([
-            "-c:a".to_owned(),
-            "aac".to_owned(),
-            "-b:a".to_owned(),
-            "160k".to_owned(),
-        ]);
-    }
-
-    args.extend([
-        "-movflags".to_owned(),
-        "+faststart".to_owned(),
-        path_to_string(output_path),
-    ]);
-
-    Ok(CommandOutput {
-        program: ffmpeg_path.to_path_buf(),
-        args,
-    })
-}
-
-fn mixed_audio_filter(input_count: usize) -> String {
-    let mut filters = Vec::with_capacity(input_count + 1);
-    for audio_index in 0..input_count {
-        filters.push(format!(
-            "[{}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{}]",
-            audio_index + 1,
-            audio_index
-        ));
-    }
-    let labels = (0..input_count)
-        .map(|audio_index| format!("[a{audio_index}]"))
-        .collect::<String>();
-    let gain = 1.0_f64 / input_count as f64;
-    filters.push(format!(
-        "{labels}amix=inputs={input_count}:duration=longest:dropout_transition=0:normalize=0,volume={gain:.6}[mixed_audio]"
-    ));
-    filters.join(";")
-}
-
-fn build_thumbnail_command(
-    ffmpeg_path: &Path,
-    media_path: &Path,
-    thumbnail_path: &Path,
-) -> CommandOutput {
-    CommandOutput {
-        program: ffmpeg_path.to_path_buf(),
-        args: vec![
-            "-hide_banner".to_owned(),
-            "-y".to_owned(),
-            "-i".to_owned(),
-            path_to_string(media_path),
-            "-frames:v".to_owned(),
-            "1".to_owned(),
-            "-vf".to_owned(),
-            "scale=480:-1".to_owned(),
-            path_to_string(thumbnail_path),
-        ],
-    }
-}
-
-fn run_ffprobe(ffprobe_path: &Path, media_path: &Path) -> Result<Value, String> {
-    let args = vec![
-        "-v".to_owned(),
-        "error".to_owned(),
-        "-select_streams".to_owned(),
-        "v:0".to_owned(),
-        "-show_entries".to_owned(),
-        "stream=width,height,r_frame_rate,avg_frame_rate,duration,codec_name:format=duration,size"
-            .to_owned(),
-        "-of".to_owned(),
-        "json".to_owned(),
-        path_to_string(media_path),
-    ];
-    let output = Command::new(ffprobe_path)
-        .args(&args)
-        .output()
-        .map_err(|error| format!("Unable to run ffprobe: {error}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "ffprobe exited with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("Unable to parse ffprobe output: {error}"))
-}
-
-fn run_logged_command(command: &CommandOutput, label: &str) -> Result<(), String> {
-    let output = Command::new(&command.program)
-        .args(&command.args)
-        .output()
-        .map_err(|error| format!("Unable to run {label}: {error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "{label} exited with status {}: {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-
-    Ok(())
-}
-
-fn ffmpeg_audio_format(sample_format: &str) -> Option<&'static str> {
-    match sample_format {
-        "i8" => Some("s8"),
-        "u8" => Some("u8"),
-        "i16" => Some("s16le"),
-        "u16" => Some("u16le"),
-        "i24" | "i32" => Some("s32le"),
-        "u24" | "u32" => Some("u32le"),
-        "f32" => Some("f32le"),
-        "f64" => Some("f64le"),
-        _ => None,
-    }
-}
-
-fn expect_magic(reader: &mut BufReader<File>, magic: &[u8], label: &str) -> Result<(), String> {
-    let mut actual = vec![0_u8; magic.len()];
-    reader
-        .read_exact(&mut actual)
-        .map_err(|error| format!("Unable to read {label} capture header: {error}"))?;
-    if actual != magic {
-        return Err(format!("Captured {label} file has an unsupported format."));
-    }
-    Ok(())
-}
-
-fn read_u64_optional(reader: &mut BufReader<File>) -> io::Result<Option<u64>> {
-    let mut first = [0_u8; 1];
-    match reader.read(&mut first)? {
-        0 => Ok(None),
-        1 => {
-            let mut bytes = [0_u8; 8];
-            bytes[0] = first[0];
-            reader.read_exact(&mut bytes[1..])?;
-            Ok(Some(u64::from_le_bytes(bytes)))
+fn audio_metadata_warning(label: &str, error: RawAudioMetadataError) -> String {
+    match error {
+        RawAudioMetadataError::MissingSampleRate => {
+            format!("{label} sample rate was missing; encoded without this source.")
         }
-        _ => unreachable!("single-byte read returned more than one byte"),
+        RawAudioMetadataError::MissingChannels => {
+            format!("{label} channel count was missing; encoded without this source.")
+        }
+        RawAudioMetadataError::MissingSampleFormat
+        | RawAudioMetadataError::UnsupportedSampleFormat => {
+            format!("{label} sample format was unsupported by the encoder; encoded without this source.")
+        }
     }
-}
-
-fn read_u64(reader: &mut BufReader<File>) -> Result<u64, String> {
-    let mut bytes = [0_u8; 8];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|error| format!("Unable to read capture timing data: {error}"))?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_u32(reader: &mut BufReader<File>) -> Result<u32, String> {
-    let mut bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|error| format!("Unable to read capture metadata: {error}"))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn frame_byte_count(width: i64, height: i64) -> Result<usize, String> {
-    let width = usize::try_from(width).map_err(|_| "Frame width is invalid.".to_owned())?;
-    let height = usize::try_from(height).map_err(|_| "Frame height is invalid.".to_owned())?;
-    width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "Frame dimensions are too large to encode.".to_owned())
-}
-
-fn probe_duration_ms(value: Option<&Value>) -> Option<i64> {
-    value?
-        .get("format")?
-        .get("duration")?
-        .as_str()?
-        .parse::<f64>()
-        .ok()
-        .map(|seconds| (seconds * 1000.0).round() as i64)
-}
-
-fn rename_replace(source: &Path, destination: &Path) -> Result<(), String> {
-    remove_file_if_exists(destination)?;
-    fs::rename(source, destination)
-        .map_err(|error| format!("Unable to move encoded media into the library: {error}"))
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<(), String> {
@@ -704,13 +584,10 @@ fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     }
 }
 
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::sidecar::{AUDIO_FILE_MAGIC, BGRA_FORMAT_CODE, VIDEO_FILE_MAGIC};
     use crate::recorder;
     use crate::storage::{
         initialize_at, CaptureAudioMode, CreateRecordingInput, CreateRecordingSessionInput,
@@ -720,7 +597,7 @@ mod tests {
 
     #[test]
     fn encodes_synthetic_capture_into_mp4_and_thumbnail() {
-        if !ffmpeg_supports_libx264() {
+        if should_skip_synthetic_encode_tests() {
             return;
         }
 
@@ -806,6 +683,16 @@ mod tests {
         assert_eq!(result.frame_count, 3);
         assert_eq!(result.width, 2);
         assert_eq!(result.height, 2);
+        assert_eq!(result.duration_ms, Some(100));
+        assert_eq!(result.media_info.duration_ms, Some(100));
+        assert_eq!(
+            result.media_info.file_size_bytes,
+            fs::metadata(&result.absolute_media_path)
+                .ok()
+                .map(|metadata| metadata.len())
+        );
+        assert!(result.backend_commands.is_empty());
+        assert_expected_backend(&result);
         assert!(Path::new(&result.absolute_media_path).is_file());
         assert!(result
             .absolute_thumbnail_path
@@ -818,7 +705,7 @@ mod tests {
 
     #[test]
     fn encodes_synthetic_capture_across_audio_modes() {
-        if !ffmpeg_supports_libx264() {
+        if should_skip_synthetic_encode_tests() {
             return;
         }
 
@@ -857,114 +744,86 @@ mod tests {
                 "{:?}",
                 result.warnings
             );
-            if write_microphone && write_source {
-                assert!(result.ffmpeg_args.contains(&"-filter_complex".to_owned()));
-                assert!(contains_args(
-                    &result.ffmpeg_args,
-                    &["-map", "[mixed_audio]"]
-                ));
-            }
+            assert_expected_backend(&result);
         }
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn build_encode_command_supports_video_only() {
-        let command = build_encode_command(
-            Path::new("/usr/bin/ffmpeg"),
-            Path::new("/tmp/video.bgra"),
-            1280,
-            720,
-            30,
-            &[],
-            Path::new("/tmp/recording.mp4"),
-        )
-        .expect("build command");
-
-        assert!(contains_args(&command.args, &["-map", "0:v:0"]));
-        assert!(command.args.contains(&"-an".to_owned()));
-        assert!(!command.args.contains(&"-filter_complex".to_owned()));
-        assert!(!command.args.contains(&"-c:a".to_owned()));
+    fn bounded_encode_dimensions_preserves_safe_even_frames() {
+        assert_eq!(bounded_encode_dimensions(1280, 720), (1280, 720));
+        assert_eq!(bounded_encode_dimensions(1279, 719), (1278, 718));
     }
 
     #[test]
-    fn build_encode_command_supports_single_audio_source() {
-        let audio_inputs = vec![prepared_audio_input(
-            "/tmp/microphone.raw",
-            48_000,
-            2,
-            "f32le",
-        )];
-        let command = build_encode_command(
-            Path::new("/usr/bin/ffmpeg"),
-            Path::new("/tmp/video.bgra"),
-            1280,
-            720,
-            30,
-            &audio_inputs,
-            Path::new("/tmp/recording.mp4"),
-        )
-        .expect("build command");
-
-        assert!(contains_args(
-            &command.args,
-            &[
-                "-f",
-                "f32le",
-                "-ar",
-                "48000",
-                "-ac",
-                "2",
-                "-i",
-                "/tmp/microphone.raw",
-            ]
-        ));
-        assert!(contains_args(&command.args, &["-map", "1:a:0"]));
-        assert!(!command.args.contains(&"-filter_complex".to_owned()));
-        assert!(contains_args(&command.args, &["-c:a", "aac"]));
+    fn bounded_encode_dimensions_downscales_retina_display_capture() {
+        assert_eq!(bounded_encode_dimensions(3600, 2338), (1662, 1080));
     }
 
     #[test]
-    fn build_encode_command_mixes_microphone_and_source_audio() {
-        let audio_inputs = vec![
-            prepared_audio_input("/tmp/microphone.raw", 48_000, 2, "f32le"),
-            prepared_audio_input("/tmp/source.raw", 44_100, 2, "s16le"),
-        ];
-        let command = build_encode_command(
-            Path::new("/usr/bin/ffmpeg"),
-            Path::new("/tmp/video.bgra"),
-            1280,
-            720,
-            30,
-            &audio_inputs,
-            Path::new("/tmp/recording.mp4"),
-        )
-        .expect("build command");
+    fn resize_bgra_nearest_samples_source_pixels() {
+        let source = bgra_pixels(&[
+            [1, 0, 0, 255],
+            [2, 0, 0, 255],
+            [3, 0, 0, 255],
+            [4, 0, 0, 255],
+            [5, 0, 0, 255],
+            [6, 0, 0, 255],
+            [7, 0, 0, 255],
+            [8, 0, 0, 255],
+        ]);
 
-        let filter = arg_after(&command.args, "-filter_complex").expect("filter");
+        let output = resize_bgra_nearest(&source, 4, 2, 2, 2).expect("resize");
 
-        assert!(filter.contains(
-            "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a0]"
-        ));
-        assert!(filter.contains(
-            "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a1]"
-        ));
-        assert!(filter.contains(
-            "[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,volume=0.500000[mixed_audio]"
-        ));
-        assert!(contains_args(&command.args, &["-map", "[mixed_audio]"]));
-        assert!(contains_args(&command.args, &["-c:a", "aac"]));
+        assert_eq!(
+            output,
+            bgra_pixels(&[
+                [1, 0, 0, 255],
+                [3, 0, 0, 255],
+                [5, 0, 0, 255],
+                [7, 0, 0, 255],
+            ])
+        );
     }
 
     #[test]
-    fn prepare_encoding_audio_input_warns_for_missing_silent_and_unsupported_sources() {
+    fn prepare_video_frames_downscales_oversized_sidecar() {
+        let root = std::env::temp_dir().join(format!("metafy-video-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test root");
+        let source_path = root.join("oversized.mfrv");
+        let output_path = root.join("encoding-video.bgra");
+        write_synthetic_video(&source_path, 1, 1930, 1080).expect("write oversized video");
+
+        let prepared = prepare_video_frames(&source_path, &output_path, Some(1930), Some(1080))
+            .expect("prepare video");
+
+        assert_eq!(prepared.width, 1920);
+        assert_eq!(prepared.height, 1074);
+        assert_eq!(prepared.thumbnail_frame.width, 1920);
+        assert_eq!(prepared.thumbnail_frame.height, 1074);
+        assert_eq!(
+            fs::metadata(&output_path).expect("output metadata").len(),
+            u64::from(1920_u32 * 1074 * 4)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_encoding_audio_inputs_warns_for_missing_empty_silent_and_unsupported_sources() {
         let root = std::env::temp_dir().join(format!("metafy-audio-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create test root");
 
         let mut warnings = Vec::new();
-        let missing = prepare_encoding_audio_input(
-            encoding_audio_input(root.join("missing.pcm"), "microphone audio", Some("f32")),
+        let missing = prepare_encoding_audio_inputs(
+            vec![encoding_audio_input(
+                root.join("missing.pcm"),
+                "microphone audio",
+                Some(48_000),
+                Some(2),
+                Some("f32"),
+            )],
             root.join("missing.raw"),
             &mut warnings,
         )
@@ -974,11 +833,39 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("capture file was missing")));
 
+        let empty_path = root.join("empty.pcm");
+        write_synthetic_audio(&empty_path, &[]).expect("write empty audio");
+        let empty_staging_path = root.join("empty.raw");
+        let empty = prepare_encoding_audio_inputs(
+            vec![encoding_audio_input(
+                empty_path,
+                "source audio",
+                Some(48_000),
+                Some(2),
+                Some("f32"),
+            )],
+            empty_staging_path.clone(),
+            &mut warnings,
+        )
+        .expect("prepare empty audio");
+        assert!(empty.is_none());
+        assert!(!empty_staging_path.exists());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("had no audio samples")));
+
         let silent_path = root.join("silent.pcm");
-        write_synthetic_audio(&silent_path, &[]).expect("write silent audio");
+        write_synthetic_audio(&silent_path, &[&synthetic_f32_stereo_block(1, 0.0)])
+            .expect("write silent audio");
         let silent_staging_path = root.join("silent.raw");
-        let silent = prepare_encoding_audio_input(
-            encoding_audio_input(silent_path, "source audio", Some("f32")),
+        let silent = prepare_encoding_audio_inputs(
+            vec![encoding_audio_input(
+                silent_path,
+                "source audio",
+                Some(48_000),
+                Some(2),
+                Some("f32"),
+            )],
             silent_staging_path.clone(),
             &mut warnings,
         )
@@ -987,13 +874,19 @@ mod tests {
         assert!(!silent_staging_path.exists());
         assert!(warnings
             .iter()
-            .any(|warning| warning.contains("had no audio samples")));
+            .any(|warning| warning.contains("contained only silence")));
 
         let unsupported_path = root.join("unsupported.pcm");
         write_synthetic_audio(&unsupported_path, &[&[0, 1, 2, 3]]).expect("write audio");
         let unsupported_staging_path = root.join("unsupported.raw");
-        let unsupported = prepare_encoding_audio_input(
-            encoding_audio_input(unsupported_path, "source audio", Some("pcm24")),
+        let unsupported = prepare_encoding_audio_inputs(
+            vec![encoding_audio_input(
+                unsupported_path,
+                "source audio",
+                Some(48_000),
+                Some(2),
+                Some("pcm24"),
+            )],
             unsupported_staging_path.clone(),
             &mut warnings,
         )
@@ -1007,27 +900,188 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn ffmpeg_supports_libx264() -> bool {
-        Command::new("ffmpeg")
-            .args(["-hide_banner", "-encoders"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains("libx264"))
-            .unwrap_or(false)
+    #[test]
+    fn prepare_encoding_audio_inputs_writes_prepared_equal_gain_mix() {
+        let root = std::env::temp_dir().join(format!("metafy-audio-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test root");
+        let microphone_path = root.join("microphone.pcm");
+        let source_path = root.join("source.pcm");
+        let staging_path = root.join(STAGING_AUDIO_FILE_NAME);
+        write_synthetic_audio(&microphone_path, &[&synthetic_f32_stereo_block(2, 0.2)])
+            .expect("write microphone");
+        write_synthetic_audio(&source_path, &[&synthetic_f32_stereo_block(1, 0.4)])
+            .expect("write source");
+
+        let mut warnings = Vec::new();
+        let prepared = prepare_encoding_audio_inputs(
+            vec![
+                encoding_audio_input(
+                    microphone_path,
+                    "microphone audio",
+                    Some(48_000),
+                    Some(2),
+                    Some("f32"),
+                ),
+                encoding_audio_input(
+                    source_path,
+                    "source audio",
+                    Some(48_000),
+                    Some(2),
+                    Some("f32"),
+                ),
+            ],
+            staging_path.clone(),
+            &mut warnings,
+        )
+        .expect("prepare audio")
+        .expect("prepared audio");
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(prepared.sample_rate, FINAL_ENCODE_SAMPLE_RATE);
+        assert_eq!(prepared.channels, FINAL_ENCODE_CHANNELS);
+        assert_eq!(prepared.sample_format, FINAL_ENCODE_SAMPLE_FORMAT);
+        assert_eq!(prepared.path, staging_path);
+        assert_eq!(
+            fs::metadata(&prepared.path)
+                .expect("prepared metadata")
+                .len(),
+            4 * std::mem::size_of::<f32>() as u64
+        );
+        let samples = read_f32le_samples(&prepared.path).expect("read prepared samples");
+        assert_eq!(samples.len(), 4);
+        assert_approx(samples[0], 0.3);
+        assert_approx(samples[1], 0.3);
+        assert_approx(samples[2], 0.1);
+        assert_approx(samples[3], 0.1);
+
+        let _ = fs::remove_dir_all(root);
     }
 
-    fn prepared_audio_input(
-        path: &str,
-        sample_rate: i64,
-        channels: i64,
-        ffmpeg_format: &'static str,
-    ) -> PreparedAudioInput {
-        PreparedAudioInput {
-            path: PathBuf::from(path),
-            sample_rate,
-            channels,
-            ffmpeg_format,
+    #[test]
+    fn prepare_encoding_audio_inputs_keeps_valid_source_when_another_is_incomplete() {
+        let root = std::env::temp_dir().join(format!("metafy-audio-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test root");
+        let microphone_path = root.join("microphone.pcm");
+        let source_path = root.join("truncated-source.pcm");
+        let staging_path = root.join(STAGING_AUDIO_FILE_NAME);
+        write_synthetic_audio(&microphone_path, &[&synthetic_f32_stereo_block(1, 0.25)])
+            .expect("write microphone");
+        fs::write(&source_path, [AUDIO_FILE_MAGIC, &[0_u8, 1_u8]].concat())
+            .expect("write truncated source");
+
+        let mut warnings = Vec::new();
+        let prepared = prepare_encoding_audio_inputs(
+            vec![
+                encoding_audio_input(
+                    microphone_path,
+                    "microphone audio",
+                    Some(48_000),
+                    Some(2),
+                    Some("f32"),
+                ),
+                encoding_audio_input(
+                    source_path,
+                    "source audio",
+                    Some(48_000),
+                    Some(2),
+                    Some("f32"),
+                ),
+            ],
+            staging_path,
+            &mut warnings,
+        )
+        .expect("prepare audio")
+        .expect("valid source still prepares");
+
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("Unable to prepare captured source audio")));
+        let samples = read_f32le_samples(&prepared.path).expect("read prepared samples");
+        assert_eq!(samples.len(), 2);
+        assert_approx(samples[0], 0.25);
+        assert_approx(samples[1], 0.25);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_encoding_audio_inputs_omits_silent_source_without_attenuating_valid_source() {
+        let root = std::env::temp_dir().join(format!("metafy-audio-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test root");
+        let microphone_path = root.join("microphone.pcm");
+        let source_path = root.join("silent-source.pcm");
+        let staging_path = root.join(STAGING_AUDIO_FILE_NAME);
+        write_synthetic_audio(&microphone_path, &[&synthetic_f32_stereo_block(1, 0.5)])
+            .expect("write microphone");
+        write_synthetic_audio(&source_path, &[&synthetic_f32_stereo_block(1, 0.0)])
+            .expect("write silent source");
+
+        let mut warnings = Vec::new();
+        let prepared = prepare_encoding_audio_inputs(
+            vec![
+                encoding_audio_input(
+                    microphone_path,
+                    "microphone audio",
+                    Some(48_000),
+                    Some(2),
+                    Some("f32"),
+                ),
+                encoding_audio_input(
+                    source_path,
+                    "source audio",
+                    Some(48_000),
+                    Some(2),
+                    Some("f32"),
+                ),
+            ],
+            staging_path,
+            &mut warnings,
+        )
+        .expect("prepare audio")
+        .expect("valid source still prepares");
+
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("source audio capture contained only silence")));
+        let samples = read_f32le_samples(&prepared.path).expect("read prepared samples");
+        assert_eq!(samples.len(), 2);
+        assert_approx(samples[0], 0.5);
+        assert_approx(samples[1], 0.5);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn should_skip_synthetic_encode_tests() -> bool {
+        let readiness = crate::media::readiness::selected_media_backend_readiness();
+
+        !readiness.available
+    }
+
+    fn assert_expected_backend(result: &EncodingResult) {
+        if cfg!(target_os = "macos") {
+            assert_eq!(result.media_info.backend_id, "macos-avfoundation");
+            assert_eq!(result.backend_id, "macos-avfoundation");
+            assert_eq!(result.backend_label, "native-macos-avfoundation");
+            assert!(result
+                .backend_messages
+                .iter()
+                .any(|message| message.contains("AVFoundation")));
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(result.media_info.backend_id, "windows-media-foundation");
+            assert_eq!(result.backend_id, "windows-media-foundation");
+            assert_eq!(result.backend_label, "native-windows-media-foundation");
+            assert!(result
+                .backend_messages
+                .iter()
+                .any(|message| message.contains("Media Foundation")));
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(result.media_info.backend_id, "linux-gstreamer");
+            assert_eq!(result.backend_id, "linux-gstreamer");
+            assert_eq!(result.backend_label, "native-linux-gstreamer");
+            assert!(result
+                .backend_messages
+                .iter()
+                .any(|message| message.contains("GStreamer")));
         }
     }
 
@@ -1157,31 +1211,17 @@ mod tests {
     fn encoding_audio_input(
         path: PathBuf,
         label: &'static str,
+        sample_rate: Option<i64>,
+        channels: Option<i64>,
         sample_format: Option<&str>,
-    ) -> EncodingAudioInput {
-        EncodingAudioInput {
+    ) -> AudioSidecarInput {
+        AudioSidecarInput {
             path,
             label,
-            staging_file_name: MICROPHONE_STAGING_AUDIO_FILE_NAME,
-            sample_rate: Some(48_000),
-            channels: Some(2),
+            sample_rate,
+            channels,
             sample_format: sample_format.map(str::to_owned),
         }
-    }
-
-    fn arg_after<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-        args.windows(2)
-            .find(|window| window[0] == name)
-            .map(|window| window[1].as_str())
-    }
-
-    fn contains_args(args: &[String], expected: &[&str]) -> bool {
-        args.windows(expected.len()).any(|window| {
-            window
-                .iter()
-                .map(String::as_str)
-                .eq(expected.iter().copied())
-        })
     }
 
     fn write_synthetic_video(
@@ -1217,14 +1257,33 @@ mod tests {
         writer.write_all(AUDIO_FILE_MAGIC)?;
 
         for (block_index, block) in blocks.iter().enumerate() {
-            let elapsed_ns = block_index as u64 * 1_000_000;
-            writer.write_all(&elapsed_ns.to_le_bytes())?;
-            writer.write_all(&elapsed_ns.to_le_bytes())?;
-            writer.write_all(&elapsed_ns.to_le_bytes())?;
+            let elapsed_ms = block_index as u64 * 10;
+            writer.write_all(&elapsed_ms.to_le_bytes())?;
+            writer.write_all(&elapsed_ms.to_le_bytes())?;
+            writer.write_all(&elapsed_ms.to_le_bytes())?;
             writer.write_all(&(block.len() as u32).to_le_bytes())?;
             writer.write_all(block)?;
         }
 
         writer.flush()
+    }
+
+    fn read_f32le_samples(path: &Path) -> io::Result<Vec<f32>> {
+        let bytes = fs::read(path)?;
+        Ok(bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
+
+    fn bgra_pixels(pixels: &[[u8; BGRA_BYTES_PER_PIXEL]]) -> Vec<u8> {
+        pixels.iter().flatten().copied().collect()
+    }
+
+    fn assert_approx(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.0001,
+            "{actual} did not match {expected}"
+        );
     }
 }

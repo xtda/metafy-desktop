@@ -48,5 +48,5 @@ This step establishes the project shape, development commands, native command bo
 
 - Actual screen/audio recording.
 - SQLite schema implementation.
-- FFmpeg and Whisper integration.
+- Media encoding and Whisper integration.
 - Packaging installers.

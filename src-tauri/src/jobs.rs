@@ -786,6 +786,7 @@ fn cleanup_recording_files(
     ] {
         remove_file_if_exists(&recording_directory.join(file_name), removed_paths)?;
     }
+    remove_files_with_prefix(&recording_directory, "recording.tmp.mp4.sb-", removed_paths)?;
 
     let Some(session) = storage
         .get_recording_session_by_recording(&recording.id)
@@ -1121,6 +1122,44 @@ fn remove_dir_if_exists(path: &Path, removed_paths: &mut Vec<String>) -> Result<
             path_to_string(path)
         )),
     }
+}
+
+fn remove_files_with_prefix(
+    directory: &Path,
+    prefix: &str,
+    removed_paths: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Unable to inspect recoverable processing files in {}: {error}",
+                path_to_string(directory)
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Unable to inspect recoverable processing file in {}: {error}",
+                path_to_string(directory)
+            )
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with(prefix) {
+            remove_file_if_exists(&path, removed_paths)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn json_string(value: &impl Serialize) -> Result<String, String> {

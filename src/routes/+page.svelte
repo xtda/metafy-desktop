@@ -50,12 +50,25 @@
       };
     };
     storage: StorageOverview;
+    mediaBackend: MediaBackendReadiness;
     nativeBoundaries: Array<{
       domain: string;
       owner: string;
       status: string;
     }>;
     availableCommands: string[];
+  };
+
+  type MediaBackendReadiness = {
+    backend: string;
+    displayName: string;
+    status: string;
+    available: boolean;
+    retryable: boolean;
+    temporaryFallback: boolean;
+    userAction: string | null;
+    missingComponents: string[];
+    messages: string[];
   };
 
   type StoragePathsSnapshot = {
@@ -707,6 +720,44 @@
   ]);
 
   const storagePaths = $derived(bootstrap?.storage.paths ?? null);
+  const mediaBackend = $derived(bootstrap?.mediaBackend ?? null);
+  const runtimePillState = $derived(
+    nativeStatus === "ready" && mediaBackend && !mediaBackend.available
+      ? "error"
+      : nativeStatus,
+  );
+  const runtimePillLabel = $derived(
+    nativeStatus === "ready" && mediaBackend
+      ? mediaBackend.available
+        ? `${mediaBackend.displayName} ready`
+        : `${mediaBackend.displayName} issue`
+      : nativeStatus === "loading"
+        ? "Syncing"
+        : nativeStatus === "error"
+          ? "Runtime offline"
+          : "Waiting",
+  );
+  const mediaBackendChipStatus = $derived(
+    mediaBackend?.available
+      ? "completed"
+      : mediaBackend?.retryable
+        ? "pending"
+        : "unavailable",
+  );
+  const mediaBackendActionLabel = $derived(
+    mediaBackend?.temporaryFallback
+      ? "Migration"
+      : mediaBackend?.retryable
+        ? "Retryable"
+        : mediaBackend?.available
+          ? "Selected"
+          : "Blocked",
+  );
+  const mediaBackendDetail = $derived(
+    mediaBackend?.userAction ??
+      mediaBackend?.messages[0] ??
+      "Media backend readiness loads from the Tauri runtime.",
+  );
 
   onMount(() => {
     applyHashView();
@@ -1705,14 +1756,8 @@
     </div>
 
     <div class="runtime-cluster" aria-live="polite">
-      <span class="runtime-pill" data-state={nativeStatus}>
-        {nativeStatus === "ready"
-          ? "Native ready"
-          : nativeStatus === "loading"
-            ? "Syncing"
-            : nativeStatus === "error"
-              ? "Runtime offline"
-              : "Waiting"}
+      <span class="runtime-pill" data-state={runtimePillState}>
+        {runtimePillLabel}
       </span>
       <button class="ghost-button" type="button" onclick={refreshApp}>
         Refresh
@@ -2155,7 +2200,7 @@
                       selectedRecordingSession?.status === "stopped"
                         ? "Encoding failed, but the temporary capture files are preserved for retry."
                         : selectedRecording.status === "processing"
-                          ? "FFmpeg is preparing the local MP4 and thumbnail."
+                          ? "Media processing is preparing the local MP4 and thumbnail."
                           : selectedRecordingSession
                             ? "Raw screen frames and microphone PCM are ready for the encoding step."
                             : "Playback appears after encoding writes a media path."}
@@ -2584,6 +2629,34 @@
             <section aria-labelledby="processing-settings">
               <h3 id="processing-settings">Processing</h3>
               <div class="settings-list">
+                <dl class="model-status-grid" aria-label="Media backend status">
+                  <div>
+                    <dt>Media backend</dt>
+                    <dd>
+                      <span
+                        class="status-chip"
+                        data-status={mediaBackendChipStatus}
+                      >
+                        {mediaBackend?.available ? "Ready" : "Needs attention"}
+                      </span>
+                    </dd>
+                    <small>{mediaBackend?.displayName ?? "Pending"}</small>
+                  </div>
+
+                  <div>
+                    <dt>Readiness</dt>
+                    <dd>
+                      <span
+                        class="status-chip"
+                        data-status={mediaBackendChipStatus}
+                      >
+                        {mediaBackendActionLabel}
+                      </span>
+                    </dd>
+                    <small>{mediaBackendDetail}</small>
+                  </div>
+                </dl>
+
                 <label class="setting-row">
                   <span>
                     <strong>Whisper model</strong>

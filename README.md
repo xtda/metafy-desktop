@@ -39,17 +39,16 @@ The native command boundary exposes local-only storage operations:
 - `start_recording_session`, `stop_recording_session`,
   `active_recording_session`, `get_recording_session_by_recording`: manage
   local capture sessions and recoverable temporary media.
-- `encode_recording`: retry the local FFmpeg encode for a stopped recording
-  session whose temporary media is still present.
+- `encode_recording`: retry local native/GStreamer media encoding for a
+  stopped recording session whose temporary media is still present.
 - `recording_asset_paths`: resolve stored recording media and thumbnail paths
   to absolute paths for Tauri asset-protocol playback.
 
 ## Local Runtime Binary Strategy
 
-The local-only MVP uses a system FFmpeg binary. Set `METAFY_FFMPEG_PATH` and
-`METAFY_FFPROBE_PATH` to explicit binary paths, or install `ffmpeg` and
-`ffprobe` on `PATH`. Packaged builds also check common system install locations,
-including Homebrew paths on macOS, so Finder-launched apps can find local tools.
+Media encoding uses platform media backends: AVFoundation on macOS, Media
+Foundation on Windows, and GStreamer on Linux. Linux systems need GStreamer and
+the required H.264/AAC plugins installed before recording output can be encoded.
 
 Whisper uses a local whisper.cpp command. Set `METAFY_WHISPER_CPP_PATH` to an
 explicit binary path, or install one of `whisper-cli`, `main`, or `whisper`.
@@ -132,7 +131,7 @@ src-tauri/
     ai.rs              Transcript-only AI payload guardrails and provider calls
     commands.rs        Tauri command boundary
     config.rs          Local-only defaults
-    encoding.rs        FFmpeg encoding, thumbnail generation, and probe metadata
+    encoding.rs        Native/GStreamer encoding, thumbnail generation, and media metadata
     lib.rs             Tauri builder entrypoint
     main.rs            Desktop process entrypoint
     recorder.rs        Capture session runtime and temporary media writers

@@ -21,13 +21,14 @@ const FORBIDDEN_KEY_FRAGMENTS: [&str; 7] = [
     "thumbnail",
     "raw_json",
 ];
-const MEDIA_PATH_MARKERS: [&str; 16] = [
+const MEDIA_PATH_MARKERS: [&str; 17] = [
     ".mp4",
     ".mov",
     ".mkv",
     ".webm",
     ".avi",
     ".mfrv",
+    ".mfcv",
     ".pcm",
     ".wav",
     ".mp3",
